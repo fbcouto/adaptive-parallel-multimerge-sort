@@ -1,0 +1,12 @@
+[package]
+name = "adaptive-parallel-multimerge-sort"
+version = "1.0.0"
+edition = "2021"
+authors = ["Fernando"]
+description = "A high-performance, adaptive parallel sorting architecture in Rust driven by Rayon, based on academic research from PDPTA'11."
+readme = "README.md"
+license = "Apache-2.0"
+keywords = ["sorting", "parallel-programming", "rayon", "algorithm", "high-performance"]
+
+[dependencies]
+rayon = "1.10"  # Garante o suporte ao paralelismo de work-stealing
