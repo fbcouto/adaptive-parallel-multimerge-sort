@@ -97,7 +97,32 @@ Performance evaluation is conducted using Criterion, the industry-standard micro
 # 📊 Performance Highlights
 
 The architecture demonstrates massive scalability compared to the standard library implementations, particularly as vector sizes cross cache boundaries and scale up to `10^7` elements.
-
+<table>
+  <tr>
+    <td align="center">
+      <img src="/images/performance_u64_random_From_10k_Onwards_cold.png" alt="u64 random Cold" width="400">
+      <br>
+      <em>u64 random Cold</em>
+    </td>
+    <td align="center">
+      <img src="/images/performance_u64_random_From_10k_Onwards_hot.png" alt="u64 random hot" width="400">
+      <br>
+      <em>u64 random hot</em>
+    </td>
+  </tr>
+  <tr>
+    <td align="center">
+      <img src="/images/performance_i32_random_From_10k_Onwards_cold.png" alt="i32 random cold" width="400">
+      <br>
+      <em>i32 random cold</em>
+    </td>
+    <td align="center">
+      <img src="/images/performance_i32_random_From_10k_Onwards_hot.png" alt="i32 random hot" width="400">
+      <br>
+      <em>i32 random hot</em>
+    </td>
+  </tr>
+</table>
 ---
 
 ## 📈 Test Case 1: Standard Primitive Scaling (`u64` Random Chaotic Distribution)
