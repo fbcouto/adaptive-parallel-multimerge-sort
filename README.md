@@ -1,10 +1,16 @@
-# Adaptive Parallel Multimerge Sort in Rust
+# 🚀 Adaptive Parallel Multimerge Sort in Rust
+
+<div align="center">
+
+### High-Performance • Hybrid • Adaptive • Parallel Sorting Engine
 
 A high-performance, hybrid, and adaptive parallel sorting architecture designed in Rust. This engine leverages Rayon for work-stealing parallelism and implements dynamic profiling heuristics to optimize sorting strategies based on data distribution, maximizing hardware utilization while avoiding common parallel overhead traps.
 
+</div>
+
 ---
 
-## Academic Background & Prior Work
+# 📚 Academic Background & Prior Work
 
 The core theoretical foundation of this parallel architecture is based on the original research and paper:
 
@@ -19,16 +25,17 @@ This engine modernizes the foundational multi-merge paradigms established in the
 
 # 🚀 Key Features
 
-- **Adaptive Oscillation Heuristic**  
-  Dynamically samples data at runtime to detect patterns (sorted, reversed, or highly repetitive/chaotic states) before committing CPU cycles.
+## Adaptive Oscillation Heuristic
+Dynamically samples data at runtime to detect patterns (sorted, reversed, or highly repetitive/chaotic states) before committing CPU cycles.
 
-- **Work-Stealing Parallelism**  
-  Driven by Rayon, partitioning workloads across available logical cores only when data scale justifies the synchronization overhead.
+## Work-Stealing Parallelism
+Driven by Rayon, partitioning workloads across available logical cores only when data scale justifies the synchronization overhead.
 
-- **ZTrait-Based Polymorphism >   Leverages Rust's trait system (T: Ord) to achieve zero-cost abstractions. The engine achieves native performance for primitives and complex structures alike through compile-time monomorphization, eliminating the need for unsafe casting or manual type dispatching.
+## ZTrait-Based Polymorphism
+Leverages Rust's trait system (`T: Ord`) to achieve zero-cost abstractions. The engine achieves native performance for primitives and complex structures alike through compile-time monomorphization, eliminating the need for unsafe casting or manual type dispatching.
 
-- **Memory-Efficient Anchoring**  
-  Optimized block thresholds (32,768 elements) to maximize L2/L3 cache locality and prevent memory bus saturation during heavy parallel merge phases.
+## Memory-Efficient Anchoring
+Optimized block thresholds (32,768 elements) to maximize L2/L3 cache locality and prevent memory bus saturation during heavy parallel merge phases.
 
 ---
 
@@ -62,16 +69,17 @@ To mitigate this, this engine runs a lightweight pre-scan:
 
 ---
 
-## Safe Compile-Time Polymorphism
+# 🔒 Safe Compile-Time Polymorphism
+
 Unlike typical high-level languages that rely on dynamic dispatch (runtime type checking), this engine utilizes Rust's static dispatch mechanism.
 
-By constraining the input slice with T: Ord + Clone + Send, the compiler generates specialized, optimized machine code for every data type processed. This design ensures that:
+By constraining the input slice with `T: Ord + Clone + Send`, the compiler generates specialized, optimized machine code for every data type processed. This design ensures that:
 
-- Safety: No unsafe pointer casting or manual type reflection is required, guaranteeing memory safety at all times.
+- **Safety:** No unsafe pointer casting or manual type reflection is required, guaranteeing memory safety at all times.
 
-- Speed: The sorting logic is "inlined" for the specific types used, providing the same machine-code efficiency as hardcoded implementations.
+- **Speed:** The sorting logic is "inlined" for the specific types used, providing the same machine-code efficiency as hardcoded implementations.
 
-- Flexibility: The engine natively supports any data type that implements standard comparison traits, without requiring source code modifications to add new types.
+- **Flexibility:** The engine natively supports any data type that implements standard comparison traits, without requiring source code modifications to add new types.
 
 ---
 
@@ -84,29 +92,43 @@ By constraining the input slice with T: Ord + Clone + Send, the compiler generat
 ---
 
 # 📊 Performance Benchmarks
-Our benchmarks indicate that by combining these strategies, the Adaptive MultiMerge engine consistently outperforms the standard Rust parallel sort (par_sort_unstable) by approximately 40% on large datasets.
-Environment: 5,000,000 u64 elements, optimized release build.
-Algorithm	Mean Time	Improvement
-Rayon par_sort_unstable	~98.7 ms	-
-MultiMerge (Adaptive)	~58.6 ms	~40.6% Faster
-Technical Features
-    • Zero-Overhead Abstractions: Uses generic T: Ord + Clone traits with pointer arithmetic for maximum speed.
-    • Cache-Friendly: The design minimizes memory writes by avoiding physical data reversals.
-    • Adaptive Fallback: Automatically switches to the fastest available parallel sorting method based on data entropy.
-    • Production Ready: Fully validated with integration tests covering chaotic, reverse-ordered, and duplicate-heavy datasets.
 
+Our benchmarks indicate that by combining these strategies, the Adaptive MultiMerge engine consistently outperforms the standard Rust parallel sort (`par_sort_unstable`) by approximately 40% on large datasets.
 
+### Environment
+- 5,000,000 `u64` elements
+- Optimized release build
+
+| Algorithm | Mean Time | Improvement |
+|---|---|---|
+| Rayon `par_sort_unstable` | ~98.7 ms | - |
+| MultiMerge (Adaptive) | ~58.6 ms | ~40.6% Faster |
 
 ---
-# Usage
-Add this to your Cargo.toml:
 
-Ini, TOML
+# ⚙️ Technical Features
+
+- **Zero-Overhead Abstractions:** Uses generic `T: Ord + Clone` traits with pointer arithmetic for maximum speed.
+- **Cache-Friendly:** The design minimizes memory writes by avoiding physical data reversals.
+- **Adaptive Fallback:** Automatically switches to the fastest available parallel sorting method based on data entropy.
+- **Production Ready:** Fully validated with integration tests covering chaotic, reverse-ordered, and duplicate-heavy datasets.
+
+---
+
+# 📦 Usage
+
+## Add this to your `Cargo.toml`
+
+```toml
 [dependencies]
 adaptive-parallel-multimerge-sort = "1.0.0"
-Integration example:
+```
 
-Rust
+---
+
+## Integration Example
+
+```rust
 use adaptive_parallel_multimerge_sort::sort;
 
 fn main() {
@@ -114,7 +136,10 @@ fn main() {
     sort(&mut data);
     println!("{:?}", data);
 }
+```
+
 ---
+
 # 📄 License
 
 This project is licensed under the Apache License 2.0.
