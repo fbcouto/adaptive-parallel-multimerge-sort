@@ -77,7 +77,9 @@ By constraining the input slice with T: Ord + Clone + Send, the compiler generat
 
 # 🧪 Benchmarking Methodology CRITERION
 
+![Gráfico de Comparação de Performance](./benchmarks/target/criterion/performance_sort/report/lines.svg)
 
+> *Para uma análise estatística detalhada, veja o [relatório interativo completo gerado pelo Criterion](./benchmarks/target/criterion/report/index.html).*
 
 ---
 
