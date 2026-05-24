@@ -25,8 +25,7 @@ This engine modernizes the foundational multi-merge paradigms established in the
 - **Work-Stealing Parallelism**  
   Driven by Rayon, partitioning workloads across available logical cores only when data scale justifies the synchronization overhead.
 
-- **Zero-Overhead Type Chaining**  
-  Implements a robust fallback mechanism using stable type reflection (`std::any::type_name`) to seamlessly handle complex stack-allocated or non-primitive structures via native standard library paths.
+- **ZTrait-Based Polymorphism >   Leverages Rust's trait system (T: Ord) to achieve zero-cost abstractions. The engine achieves native performance for primitives and complex structures alike through compile-time monomorphization, eliminating the need for unsafe casting or manual type dispatching.
 
 - **Memory-Efficient Anchoring**  
   Optimized block thresholds (32,768 elements) to maximize L2/L3 cache locality and prevent memory bus saturation during heavy parallel merge phases.
@@ -63,15 +62,16 @@ To mitigate this, this engine runs a lightweight pre-scan:
 
 ---
 
-## Stable Micro-Reflection Fallback
+## Safe Compile-Time Polymorphism
+Unlike typical high-level languages that rely on dynamic dispatch (runtime type checking), this engine utilizes Rust's static dispatch mechanism.
 
-Because benchmarking suites evaluate arrays using both primitive integers and custom heavy FFI wrappers (such as 16-byte `F128` structs), the engine utilizes a safe pointer-casting matrix based on type names.
+By constraining the input slice with T: Ord + Clone + Send, the compiler generates specialized, optimized machine code for every data type processed. This design ensures that:
 
-This guarantees that:
+- Safety: No unsafe pointer casting or manual type reflection is required, guaranteeing memory safety at all times.
 
-- Standard primitives enter the maximum-performance parallel path.
-- Complex types fall back gracefully to optimized native paths.
-- Compiler panics and strict lifetime constraints are avoided.
+- Speed: The sorting logic is "inlined" for the specific types used, providing the same machine-code efficiency as hardcoded implementations.
+
+- Flexibility: The engine natively supports any data type that implements standard comparison traits, without requiring source code modifications to add new types.
 
 ---
 
