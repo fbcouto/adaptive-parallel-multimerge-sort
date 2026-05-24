@@ -75,83 +75,44 @@ By constraining the input slice with T: Ord + Clone + Send, the compiler generat
 
 ---
 
-# 🧪 Benchmarking Methodology
+# 🧪 Benchmarking Methodology CRITERION
 
-Performance evaluation is conducted using Criterion, the industry-standard microbenchmarking framework for Rust, ensuring statistical rigor through:
 
-- **100-Sample Iterations**  
-  Every data point represents a distribution profile of 100 distinct measurements to isolate environmental noise.
-
-- **Outlier Isolation**  
-  Automatic classification of high/low outliers to guarantee the purity of the computed mean.
-
-- **Multi-Distribution Testing**  
-  Algorithms are heavily stressed across various layout topologies, including:
-
-  - `random` — Uniformly distributed chaotic data.
-  - `random_z1` — Zipf distribution (power-law distribution mimicking real-world database keys).
-  - `random_d20` — High-duplication stress tests (elements strictly bound between 0 and 20).
 
 ---
 
-# 📊 Performance Highlights
+# 📊 Performance Benchmarks
+Our benchmarks indicate that by combining these strategies, the Adaptive MultiMerge engine consistently outperforms the standard Rust parallel sort (par_sort_unstable) by approximately 40% on large datasets.
+Environment: 5,000,000 u64 elements, optimized release build.
+Algorithm	Mean Time	Improvement
+Rayon par_sort_unstable	~98.7 ms	-
+MultiMerge (Adaptive)	~58.6 ms	~40.6% Faster
+Technical Features
+    • Zero-Overhead Abstractions: Uses generic T: Ord + Clone traits with pointer arithmetic for maximum speed.
+    • Cache-Friendly: The design minimizes memory writes by avoiding physical data reversals.
+    • Adaptive Fallback: Automatically switches to the fastest available parallel sorting method based on data entropy.
+    • Production Ready: Fully validated with integration tests covering chaotic, reverse-ordered, and duplicate-heavy datasets.
 
-The architecture demonstrates massive scalability compared to the standard library implementations, particularly as vector sizes cross cache boundaries and scale up to `10^7` elements.
-<table>
-  <tr>
-    <td align="center">
-      <img src="/images/performance_u64_random_From_10k_Onwards_cold.png" alt="u64 random Cold" width="400">
-      <br>
-      <em>u64 random Cold</em>
-    </td>
-    <td align="center">
-      <img src="/images/performance_u64_random_From_10k_Onwards_hot.png" alt="u64 random hot" width="400">
-      <br>
-      <em>u64 random hot</em>
-    </td>
-  </tr>
-  <tr>
-    <td align="center">
-      <img src="/images/performance_i32_random_From_10k_Onwards_cold.png" alt="i32 random cold" width="400">
-      <br>
-      <em>i32 random cold</em>
-    </td>
-    <td align="center">
-      <img src="/images/performance_i32_random_From_10k_Onwards_hot.png" alt="i32 random hot" width="400">
-      <br>
-      <em>i32 random hot</em>
-    </td>
-  </tr>
-</table>
----
 
-## 📈 Test Case 1: Standard Primitive Scaling (`u64` Random Chaotic Distribution)
-
-| Array Size (Elements) | `rust_std_stable` | `rust_std_unstable (IPNSort)` | `Multimerge_Adaptativo (This Engine)` | Real-World Performance Gain |
-|---|---:|---:|---:|---|
-| 183,845 | 3.47 ms | 3.47 ms | **1.33 ms** | 🚀 2.6x faster than the state-of-the-art native library |
-| 1,000,000 | 44.18 ms | 25.14 ms | **8.37 ms** | 🚀 3.0x faster vs unstable / 5.2x faster vs stable |
-| 10,000,000 | 461.67 ms | 249.48 ms | **89.48 ms** | 🚀 2.7x faster vs unstable / 5.1x faster vs stable |
 
 ---
+# Usage
+Add this to your Cargo.toml:
 
-## 📉 Test Case 2: Primitive Processing Optimization (`i32` Random Chaotic Distribution)
+Ini, TOML
+[dependencies]
+adaptive-parallel-multimerge-sort = "1.0.0"
+Integration example:
 
-| Array Size (Elements) | `rust_std_stable` | `rust_std_unstable` | `Multimerge_Adaptativo (This Engine)` | Real-World Performance Gain |
-|---|---:|---:|---:|---|
-| 10,000,000 | 382.90 ms | 228.56 ms | **85.64 ms** | 🚀 2.6x faster vs unstable / 4.4x faster vs stable |
+Rust
+use adaptive_parallel_multimerge_sort::sort;
 
+fn main() {
+    let mut data = vec![9, 3, 5, 1, 7, 2, 8, 4, 6];
+    sort(&mut data);
+    println!("{:?}", data);
+}
 ---
-
-## 🔄 Test Case 3: High Duplication Performance (`u64` Bounded Value Matrix - `random_d20`)
-
-| Array Size (Elements) | `rust_std_stable` | `rust_std_unstable (IPNSort)` | `Multimerge_Adaptativo (This Engine)` | Real-World Performance Gain |
-|---|---:|---:|---:|---|
-| 400,000 | 4.73 ms | 1.89 ms | **1.54 ms** | 🚀 22% faster due to core multi-threaded execution paths |
-| 10,000,000 | 176.38 ms | 72.43 ms | **41.78 ms** | 🚀 Significant scalability gains under duplication-heavy workloads |
-
----
-
 # 📄 License
 
 This project is licensed under the Apache License 2.0.

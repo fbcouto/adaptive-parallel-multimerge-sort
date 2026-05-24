@@ -10,3 +10,12 @@ keywords = ["sorting", "parallel-programming", "rayon", "algorithm", "high-perfo
 
 [dependencies]
 rayon = "1.10"  # Garante o suporte ao paralelismo de work-stealing
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+rand = "0.8"
+rayon = "1.10" # O rival a ser batido
+
+[[bench]]
+name = "arena_paralela"
+harness = false
