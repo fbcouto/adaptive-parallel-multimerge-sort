@@ -1,15 +1,17 @@
 use rayon::prelude::*;
 
-fn calcular_minrun(mut n: usize) -> usize {
+// --- Generic Utilities ---
+
+fn calculate_minrun(mut n: usize) -> usize {
     let mut r = 0;
-    while n >= 64 {
-        r |= n & 1;
-        n >>= 1;
+    while n >= 64 { 
+        r |= n & 1; 
+        n >>= 1; 
     }
     n + r
 }
 
-fn insertion_sort<T: Ord>(arr: &mut [T]) {
+pub fn insertion_sort<T: Ord>(arr: &mut [T]) {
     for i in 1..arr.len() {
         let mut j = i;
         while j > 0 && arr[j - 1] > arr[j] {
@@ -19,164 +21,144 @@ fn insertion_sort<T: Ord>(arr: &mut [T]) {
     }
 }
 
-fn detectar_tendencia_global<T: Ord>(arr: &mut [T]) -> bool {
+fn detect_global_trend<T: Ord + Sync>(arr: &mut [T]) -> bool {
     let n = arr.len();
-    if n <= 1 { return true; }
+    if n < 100_000 { return false; } 
 
-    let mut ordenado = true;
-    for i in 0..n - 1 {
-        if arr[i] > arr[i + 1] {
-            ordenado = false;
-            break;
-        }
-    }
-    if ordenado { return true; }
+    let chunk_size = 32768; 
+    let num_blocks = (n + chunk_size - 1) / chunk_size;
+    let immutable_arr: &[T] = arr;
 
-    let mut invertido = true;
-    for i in 0..n - 1 {
-        if arr[i] < arr[i + 1] {
-            invertido = false;
-            break;
-        }
-    }
-    if invertido {
-        arr.reverse();
-        return true;
-    }
+    let (ascending, descending) = (0..num_blocks)
+        .into_par_iter()
+        .map(|i| {
+            let start = i * chunk_size;
+            let end = std::cmp::min(start + chunk_size + 1, n);
+            let overlapping_chunk = &immutable_arr[start..end];
+            
+            let mut asc = 0;
+            let mut desc = 0;
+            for j in 1..overlapping_chunk.len() {
+                if overlapping_chunk[j - 1] < overlapping_chunk[j] { asc += 1; }
+                else if overlapping_chunk[j - 1] > overlapping_chunk[j] { desc += 1; }
+            }
+            (asc, desc)
+        })
+        .reduce(|| (0, 0), |a, b| (a.0 + b.0, a.1 + b.1));
 
+    if descending == 0 { return true; }
+    if ascending == 0 { arr.reverse(); return true; }
+    if descending > 0 && descending < (n / 20) { return false; }
+    
     false
 }
 
-pub fn ordenar_multi_merge<T: Ord + Clone + Send>(arr: &mut [T]) {
+// --- Adaptive Main Engine ---
+
+pub fn multi_merge_sort_generic<T: Ord + Sync + Send + Clone>(arr: &mut [T]) {
     let n = arr.len();
+    
+    // Safety check: Prevent panic if the array is empty
+    if n == 0 { return; } 
+
     if n < 1024 {
         insertion_sort(arr);
         return;
     }
     
-    if detectar_tendencia_global(arr) { return; }
+    if detect_global_trend(arr) { return; }
 
-    // HEURÍSTICA DE OSCILAÇÃO
-    let mut e_caos_puro = false;
+    let mut is_pure_chaos = false;
     if n > 120 {
         let mid = n / 2;
-        let mut mudancas_direcao = 0;
-        let mut subindo = arr[mid] <= arr[mid + 1];
+        let mut direction_changes = 0;
+        let mut is_ascending = arr[mid] <= arr[mid + 1];
         
         for i in (mid + 1)..(mid + 100).min(n - 1) {
-            let direcao_atual = arr[i] <= arr[i + 1];
-            if direcao_atual != subindo {
-                mudancas_direcao += 1;
-                subindo = direcao_atual;
+            let current_direction = arr[i] <= arr[i + 1];
+            if current_direction != is_ascending {
+                direction_changes += 1;
+                is_ascending = current_direction;
             }
         }
-        
-        if mudancas_direcao > 15 {
-            e_caos_puro = true;
-        }
+        if direction_changes > 15 { is_pure_chaos = true; }
     }
 
-    if !e_caos_puro {
+    if !is_pure_chaos {
         let mut buffer = vec![arr[0].clone(); n];
         let num_threads = rayon::current_num_threads();
-        
-        let threshold = (n / num_threads).max(32_768); 
-        
-        sort_recursivo_paralelo(arr, &mut buffer, threshold);
+        let threshold = (n / num_threads).max(1_000_000); 
+        parallel_recursive_sort(arr, &mut buffer, threshold);
     } else {
         arr.par_sort_unstable();
     }
 }
 
-fn ordenar_sequencial_timsort_style<T: Ord + Clone>(arr: &mut [T], buffer: &mut [T]) {
+// --- Processing Core (Path A) ---
+
+fn sequential_timsort_style<T: Ord + Clone>(arr: &mut [T], buffer: &mut [T]) {
     let n = arr.len();
-    let minrun = calcular_minrun(n);
+    let minrun = calculate_minrun(n);
 
     for i in (0..n).step_by(minrun) {
         let end = (i + minrun).min(n);
         insertion_sort(&mut arr[i..end]);
     }
 
-    let mut tamanho_bloco = minrun;
-    while tamanho_bloco < n {
-        for esq in (0..n).step_by(tamanho_bloco * 2) {
-            let meio = (esq + tamanho_bloco).min(n);
-            let dir = (esq + tamanho_bloco * 2).min(n);
-            if meio < dir {
-                mesclar_estavel(&mut arr[esq..dir], buffer, meio - esq);
+    let mut block_size = minrun;
+    while block_size < n {
+        for left in (0..n).step_by(block_size * 2) {
+            let mid = (left + block_size).min(n);
+            let right = (left + block_size * 2).min(n);
+            if mid < right {
+                stable_merge(&mut arr[left..right], buffer, mid - left);
             }
         }
-        tamanho_bloco *= 2;
+        block_size *= 2;
     }
 }
 
-fn sort_recursivo_paralelo<T: Ord + Clone + Send>(arr: &mut [T], buffer: &mut [T], threshold: usize) {
+fn parallel_recursive_sort<T: Ord + Clone + Send>(arr: &mut [T], buffer: &mut [T], threshold: usize) {
     let n = arr.len();
     if n <= threshold {
-        ordenar_sequencial_timsort_style(arr, buffer);
+        sequential_timsort_style(arr, buffer);
         return;
     }
 
-    let meio = n / 2;
-    let (arr_esq, arr_dir) = arr.split_at_mut(meio);
-    let (buf_esq, buf_dir) = buffer.split_at_mut(meio);
+    let mid = n / 2;
+    let (arr_left, arr_right) = arr.split_at_mut(mid);
+    let (buf_left, buf_right) = buffer.split_at_mut(mid);
 
     rayon::join(
-        || sort_recursivo_paralelo(arr_esq, buf_esq, threshold),
-        || sort_recursivo_paralelo(arr_dir, buf_dir, threshold),
+        || parallel_recursive_sort(arr_left, buf_left, threshold),
+        || parallel_recursive_sort(arr_right, buf_right, threshold),
     );
 
-    mesclar_estavel(arr, buffer, meio);
+    stable_merge(arr, buffer, mid);
 }
 
-fn mesclar_estavel<T: Ord + Clone>(arr: &mut [T], buffer: &mut [T], meio: usize) {
+fn stable_merge<T: Ord + Clone>(arr: &mut [T], buffer: &mut [T], mid: usize) {
     let n = arr.len();
     buffer[..n].clone_from_slice(&arr[..n]);
 
     let mut i = 0;
-    let mut j = meio;
+    let mut j = mid;
     let mut k = 0;
 
-    while i < meio && j < n {
-        if buffer[i] <= buffer[j] {
-            arr[k] = buffer[i].clone();
-            i += 1;
-        } else {
-            arr[k] = buffer[j].clone();
-            j += 1;
+    while i < mid && j < n {
+        if buffer[i] <= buffer[j] { 
+            arr[k] = buffer[i].clone(); 
+            i += 1; 
+        } else { 
+            arr[k] = buffer[j].clone(); 
+            j += 1; 
         }
         k += 1;
     }
 
-    if i < meio {
-        arr[k..k + (meio - i)].clone_from_slice(&buffer[i..meio]);
-    } else if j < n {
-        arr[k..k + (n - j)].clone_from_slice(&buffer[j..n]);
-    }
-}
-
-pub fn ordenar_multi_merge_generic<T: Ord>(arr: &mut [T]) {
-    let name = std::any::type_name::<T>();
-
-    if name == std::any::type_name::<i32>() {
-        let safe_arr = unsafe { &mut *(arr as *mut [T] as *mut [i32]) };
-        ordenar_multi_merge(safe_arr);
-    } else if name == std::any::type_name::<u64>() {
-        let safe_arr = unsafe { &mut *(arr as *mut [T] as *mut [u64]) };
-        ordenar_multi_merge(safe_arr);
-    } else if name == std::any::type_name::<u32>() {
-        let safe_arr = unsafe { &mut *(arr as *mut [T] as *mut [u32]) };
-        ordenar_multi_merge(safe_arr);
-    } else if name == std::any::type_name::<u8>() {
-        let safe_arr = unsafe { &mut *(arr as *mut [T] as *mut [u8]) };
-        ordenar_multi_merge(safe_arr);
-    } else if name == std::any::type_name::<u16>() {
-        let safe_arr = unsafe { &mut *(arr as *mut [T] as *mut [u16]) };
-        ordenar_multi_merge(safe_arr);
-    } else if name == std::any::type_name::<u128>() {
-        let safe_arr = unsafe { &mut *(arr as *mut [T] as *mut [u128]) };
-        ordenar_multi_merge(safe_arr);
-    } else {
-        arr.sort_unstable();
+    if i < mid { 
+        arr[k..k + (mid - i)].clone_from_slice(&buffer[i..mid]); 
+    } else if j < n { 
+        arr[k..k + (n - j)].clone_from_slice(&buffer[j..n]); 
     }
 }
