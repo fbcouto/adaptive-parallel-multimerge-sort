@@ -224,11 +224,12 @@ fn phase_2_normalizing_pass<T: Ord + Clone + Send>(arr: &[T], buffer: &mut [T], 
 // 3. ADAPTIVE RECURSIVE ENGINE
 // ==========================================
 
+
 fn parallel_recursive_sort<T: Ord + Clone + Send>(arr: &mut [T], buffer: &mut [T], threshold: usize) {
     let n = arr.len();
     
-    // 1. LEAF NODE HYBRIDIZATION
-    if n <= threshold {
+     // 1. LEAF NODE HYBRIDIZATION
+    if n < get_dynamic_threshold::<T>() {
         if evaluate_local_entropy(arr) { arr.sort_unstable(); } 
         else { arr.sort(); }
         return;

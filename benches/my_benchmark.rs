@@ -52,7 +52,11 @@ fn generate_sawtooth(size: usize) -> Vec<u64> {
 // ==========================================
 
 fn bench_final_arena(c: &mut Criterion) {
-    let sizes = [1_000_000, 10_000_000, 100_000_000];
+    let sizes = [
+        1_000_000, 
+        10_000_000,
+        100_000_000,
+        300_000_000];
 
     // Define the scenarios and their respective generators
     let scenarios = [
@@ -76,16 +80,16 @@ fn bench_final_arena(c: &mut Criterion) {
             let base_data = generator(size);
 
             // 1. Rayon Unstable (PDQSort in-place)
-            group.bench_with_input(BenchmarkId::new("1_Rayon_Unstable", size), &size, |b, _| {
-                b.iter_batched(
-                    || base_data.clone(),
-                    |mut d| d.par_sort_unstable(),
-                    BatchSize::LargeInput,
-                )
-            });
+        //    group.bench_with_input(BenchmarkId::new("1_Rayon_Unstable", size), &size, |b, _| {
+        //        b.iter_batched(
+         //           || base_data.clone(),
+          //         |mut d| d.par_sort_unstable(),
+          //          BatchSize::LargeInput,
+        //        )
+       //     });
 
             // 2. Rayon Stable (Standard Rust Parallel Merge)
-            group.bench_with_input(BenchmarkId::new("2_Rayon_Stable", size), &size, |b, _| {
+            group.bench_with_input(BenchmarkId::new("1_Rayon_Stable", size), &size, |b, _| {
                 b.iter_batched(
                     || base_data.clone(),
                     |mut d| d.par_sort(),
@@ -94,7 +98,7 @@ fn bench_final_arena(c: &mut Criterion) {
             });
 
             // 3. MultiMerge (Your Adaptive Engine)
-            group.bench_with_input(BenchmarkId::new("3_Adaptive_MultiMerge", size), &size, |b, _| {
+            group.bench_with_input(BenchmarkId::new("2_MultiMerge", size), &size, |b, _| {
                 b.iter_batched(
                     || base_data.clone(),
                     |mut d| multi_merge(black_box(&mut d)),
