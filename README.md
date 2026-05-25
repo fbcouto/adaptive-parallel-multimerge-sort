@@ -63,6 +63,7 @@ To mitigate this, this engine runs a lightweight pre-scan:
            /             |                 \
      Early Exit     Parallel Unstable   Parallel Merge Sort
     (In-place/Rev)    (Work-Stealing)    (Timsort-style + Rayon)
+```
 # 🔒 Safe Compile-Time Polymorphism
 
 Unlike typical high-level languages that rely on dynamic dispatch (runtime type checking), this engine utilizes Rust's static dispatch mechanism.
@@ -77,10 +78,8 @@ By constraining the input slice with `T: Ord + Clone + Send`, the compiler gener
 
 # 🧪 Benchmarking Methodology (CRITERION)
 
-![Performance Comparison Chart](.images/lines.png)
-![Violin Plot](.images/violin.png)
-
-> *For a detailed statistical analysis, view the [full interactive Criterion report](./benchmarks/target/criterion/report/index.html).*
+![Performance Comparison Chart](images/lines.png)
+![Violin Plot](images/violin.png)
 
 ---
 
