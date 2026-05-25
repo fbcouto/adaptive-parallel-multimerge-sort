@@ -17,5 +17,5 @@ rand = "0.8"
 rayon = "1.10" # O rival a ser batido
 
 [[bench]]
-name = "arena_paralela"
+name = "my_benchmark"
 harness = false

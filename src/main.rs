@@ -1,18 +1,18 @@
-// O nome do crate é o que está no seu Cargo.toml
+// The crate name matches what is in your Cargo.toml
 use adaptive_parallel_multimerge_sort::sort;
 
 fn main() {
-    // Exemplo de teste simples
+    // Simple test example
     let mut data = vec![9, 5, 1, 3, 7, 8, 2, 6, 4, 0, 15, 12];
     
-    println!("Antes da ordenação: {:?}", data);
+    println!("Before sorting: {:?}", data);
     
-    // Chama a sua função exportada no lib.rs
+    // Calls your exported function from lib.rs
     sort(&mut data);
     
-    println!("Após a ordenação:   {:?}", data);
+    println!("After sorting:  {:?}", data);
     
-    // Verificação simples
+    // Simple verification
     let is_sorted = data.windows(2).all(|w| w[0] <= w[1]);
-    println!("Ordenação correta?  {}", is_sorted);
+    println!("Is sorted? {}", is_sorted);
 }
