@@ -1,19 +1,11 @@
-// ==========================================
-// UNICA MUDANCA vs o original: bottom_up_merge() nao alocava mais um
-// Vec<usize> por nivel de recursao para remapear `right_offsets` (1001
-// alocacoes de heap so no cenario Sawtooth_1000/1M). Agora `base = offsets[0]`
-// e propagado como escalar e left_offsets/right_offsets viram sub-slices
-// (copia zero). Assinatura e comportamento externo identicos; os 12 testes
-// originais abaixo passam sem alteracao. O merge bidirecional (bidirectional_merge,
-// merge_front, merge_back, parallel_merge) NAO foi tocado.
-// ==========================================
-
 use rayon::prelude::*;
 
 // ==========================================
 // FASE 0: ESCUDO DE ENTROPIA O(1)
 // ==========================================
 
+/// Heurística baratíssima (amostra ~100 elementos perto do meio).
+/// Decide se vale a pena rastrear blocos, ou se os dados são puro ruído/caos.
 fn evaluate_local_entropy<T: Ord>(arr: &[T]) -> bool {
     let n = arr.len();
     if n < 120 {
@@ -22,7 +14,8 @@ fn evaluate_local_entropy<T: Ord>(arr: &[T]) -> bool {
     let mid = n / 2;
     let mut direction_changes = 0;
     let mut is_ascending = arr[mid] <= arr[mid + 1];
-
+    
+    // Varre ~100 elementos centrais
     for i in (mid + 1)..(mid + 100).min(n - 1) {
         let current_direction = arr[i] <= arr[i + 1];
         if current_direction != is_ascending {
@@ -30,11 +23,12 @@ fn evaluate_local_entropy<T: Ord>(arr: &[T]) -> bool {
             is_ascending = current_direction;
         }
     }
+    // Se a direção mudar mais de 15 vezes em 100 elementos, é caos puro (Random/LowCardinality)
     direction_changes > 15
 }
 
 // ==========================================
-// FASE 1: DETECÇÃO FRACTAL
+// FASE 1: DETECÇÃO FRACTAL (A CAMPEÃ DA L1 CACHE)
 // ==========================================
 
 pub fn detect_global_trend<T: Ord + Sync>(arr: &[T]) -> Vec<i64> {
@@ -43,6 +37,7 @@ pub fn detect_global_trend<T: Ord + Sync>(arr: &[T]) -> Vec<i64> {
         return if n == 1 { vec![1] } else { Vec::new() };
     }
 
+    // Nível 1: Macro-blocos de 32.768 (Avanço de 32.767 para 1 elemento de sobreposição)
     let macro_slice_len = 32_768;
     let macro_step = macro_slice_len - 1;
 
@@ -65,9 +60,11 @@ pub fn detect_global_trend<T: Ord + Sync>(arr: &[T]) -> Vec<i64> {
         )
 }
 
+/// Nível 2: Micro-blocos no ponto doce absoluto de 768 (Avanço de 767)
 fn process_macro_block<T: Ord + Sync>(arr: &[T]) -> Vec<i64> {
     let n = arr.len();
-
+    
+    // O Tamanho Campeão validado no Benchmark
     let micro_slice_len = 512;
     let micro_step = micro_slice_len - 1;
 
@@ -90,6 +87,7 @@ fn process_macro_block<T: Ord + Sync>(arr: &[T]) -> Vec<i64> {
         )
 }
 
+/// Costura pura de metadados sem ler o array, O(log N) em paralelo via Reduce.
 fn merge_metadata_pure(mut left: Vec<i64>, right: Vec<i64>) -> Vec<i64> {
     if left.is_empty() { return right; }
     if right.is_empty() { return left; }
@@ -97,6 +95,7 @@ fn merge_metadata_pure(mut left: Vec<i64>, right: Vec<i64>) -> Vec<i64> {
     let last_left = left.pop().unwrap();
     let first_right = right[0];
 
+    // REGRA DO SINGLETON
     if last_left.unsigned_abs() == 1 {
         left.extend_from_slice(&right);
         return left;
@@ -301,13 +300,6 @@ fn block_offsets(metadata: &[i64]) -> Vec<usize> {
     offsets
 }
 
-// CORRIGIDO: em vez de remapear `right_offsets` para um novo Vec<usize> a
-// cada nivel (1 alocacao de heap por no interno da arvore), propagamos o
-// deslocamento global como um escalar (`base`) e so subtraimos no ponto de
-// uso. `left_offsets`/`right_offsets` passam a ser sub-slices de `offsets`
-// (copia zero). `offsets[0]` e sempre o inicio global do slice atual - essa
-// invariante e mantida por `block_offsets` (comeca em 0) e preservada em
-// cada chamada recursiva abaixo.
 fn bottom_up_merge<T: Ord + Clone + Send + Sync>(
     v: &mut [T],
     buf: &mut [T],
@@ -335,19 +327,18 @@ fn bottom_up_merge<T: Ord + Clone + Send + Sync>(
         return;
     }
 
-    let base = offsets[0];
     let split_idx = num_blocks / 2;
-    let mid = offsets[split_idx] - base;
+    let mid = offsets[split_idx];
     let (left_meta, right_meta) = metadata.split_at(split_idx);
     let left_offsets = &offsets[..=split_idx];
-    let right_offsets = &offsets[split_idx..];
+    let right_offsets: Vec<usize> = offsets[split_idx..].iter().map(|&o| o - mid).collect();
 
     {
         let (v_l, v_r) = v.split_at_mut(mid);
         let (buf_l, buf_r) = buf.split_at_mut(mid);
         rayon::join(
             || bottom_up_merge(v_l, buf_l, left_meta, left_offsets, leaf_size, !into_buf),
-            || bottom_up_merge(v_r, buf_r, right_meta, right_offsets, leaf_size, !into_buf),
+            || bottom_up_merge(v_r, buf_r, right_meta, &right_offsets, leaf_size, !into_buf),
         );
     }
 
@@ -381,11 +372,13 @@ pub fn multi_merge_sort<T: Ord + Clone + Send + Sync>(arr: &mut [T]) {
         return;
     }
 
+    // Se a amostra indicar alto ruído (entropia caótica), usa o escudo e aborta a extração de blocos
     if evaluate_local_entropy(arr) {
-        arr.par_sort();
+        arr.par_sort(); 
         return;
     }
 
+    // Caso contrário, vai para o caminho estruturado super otimizado
     let metadata = detect_global_trend(arr);
 
     if metadata.len() == 1 {
@@ -402,7 +395,7 @@ pub fn multi_merge_sort<T: Ord + Clone + Send + Sync>(arr: &mut [T]) {
 }
 
 // ==========================================
-// TESTES (copiados verbatim do arquivo original do usuario)
+// TESTES
 // ==========================================
 
 #[cfg(test)]
@@ -630,12 +623,13 @@ mod tests {
             b.sort();
 
             let expected = reference_merge(&a, &b);
-            let mut dest = vec![Keyed { key: 0, idx: 0 }; a.len() + b.len()];
+            let mut dest = vec![Keyed { key: 0, idx: 0 }; m + n];
             bidirectional_merge(&a, &b, &mut dest, leaf_size);
 
             assert_eq!(
                 dest.iter().map(|x| (x.key, x.idx)).collect::<Vec<_>>(),
-                expected.iter().map(|x| (x.key, x.idx)).collect::<Vec<_>>()
+                expected.iter().map(|x| (x.key, x.idx)).collect::<Vec<_>>(),
+                "trial {trial}: m={m} n={n}"
             );
         }
     }
