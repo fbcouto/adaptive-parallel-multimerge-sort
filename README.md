@@ -73,8 +73,8 @@ By constraining the input slice with `T: Ord + Clone + Send + Sync`, the compile
 
 # 🧪 Benchmarking Methodology (CRITERION)
 
-![Performance Comparison Chart](.images/lines.png)
-![Violin Plot](.images/violin.png)
+![Performance Comparison Chart](images/lines.png)
+![Violin Plot](images/violin.png)
 
 
 ---
