@@ -24,18 +24,31 @@ Standard parallel sorting algorithms often suffer from "task explosion" or cache
 3. **Hybrid $O(\log N)$ Co-Rank Merge:** Instead of discovering boundaries sequentially, it computes them beforehand using a double binary search (`co_rank`). This guarantees a collision-free bidirectional parallel merge.
 4. **Initialization Elision (Zero-Cost Allocation):** Buffer memory allocation for standard `Copy` types leverages memory bypass techniques (`unsafe { buffer.set_len(n); }` in Rust, `std::make_unique_for_overwrite` in C++) to prevent the OS from zero-filling gigabytes of RAM unnecessarily.
 
+
 ## 📊 Benchmark Highlights
 
-Tested on an Intel CPU against Rayon using a slice of 100,000,000 elements (`u64`):
+Tested on modern multi-core hardware against Rust's native `rayon` library, pushing up to **2.4 Gigabytes of raw `u64` keys (300 Million elements)**.
 
-| Scenario (100M Elements) | Rayon | C++ MultiMerge | Rust MultiMerge (Copy) | Winner |
+### Scenario A: 100 Million Elements
+| Scenario | Rayon (Baseline) | C++ MultiMerge | Rust MultiMerge (Copy) | Winner |
 | :--- | :--- | :--- | :--- | :--- |
-| **Fully Sorted** | 86.18 ms | 85.26 ms | **86.19 ms** | **Tie (Hardware Memory Bound ~1.16 Gelem/s)** |
-| **Reversed** | 150.27 ms | 155.83 ms | **150.28 ms** | **Tie (Parallel SIMD Reverse)** |
-| **Sawtooth (Database-like)** | 1.00 s | 1.01 s | **0.82 s (820 ms)** | **Rust MultiMerge (Copy)** |
-| **Random Chaos** | **1.99 s** | 2.87 s | 2.01 s | **Rayon** |
+| **Fully Sorted** | 87.20 ms | **86.11 ms** | 87.37 ms | **Tie (Hardware Bound ~1.16 Gelem/s)** |
+| **Reversed** | 161.15 ms | 159.50 ms | **159.09 ms** | **Rust MultiMerge (Copy)** |
+| **Sawtooth (Database-like)** | **1.02 s** | 1.07 s | 1.05 s | **Rayon (~3% lead)** |
+| **Random Chaos** | 2.09 s | 2.76 s | **1.99 s** | **Rust MultiMerge (Copy)** |
+| **Low Cardinality** | **1.95 s** | 2.57 s | 1.96 s | **Tie (Rayon / Rust)** |
 
-> *Note: In Sawtooth scenarios (structured runs common in databases), the Rust Copy engine obliterates standard libraries due to its zero-copy slice tracking and $O(\log N)$ parallel merges.*
+### Scenario B: 300 Million Elements (Extreme Scale)
+| Scenario | Rayon (Baseline) | C++ MultiMerge | Rust MultiMerge (Copy) | Winner |
+| :--- | :--- | :--- | :--- | :--- |
+| **Fully Sorted** | 261.53 ms | **257.09 ms** | 257.44 ms | **C++ / Rust (Hardware Bound)** |
+| **Reversed** | **446.24 ms** | 450.33 ms | 461.44 ms | **Rayon (~1% lead)** |
+| **Sawtooth (Database-like)** | **2.98 s** | 3.14 s | 3.10 s | **Rayon (~3% lead)** |
+| **Random Chaos** | **6.42 s** | 9.22 s | 6.50 s | **Rayon / Rust Tie** |
+| **Low Cardinality** | **6.36 s** | 8.89 s | 7.02 s | **Rayon** |
+
+> *Note: Both C++ and Rust implementations achieve processing speeds of over **1 Billion elements per second** in highly structured datasets (Sorted), maxing out the physical memory bandwidth. In chaotic and massive datasets, the $O(1)$ Entropy Shield ensures safe bailout to standard parallel fallback engines, maintaining state-of-the-art times safely close to Rayon.*
+
 
 ## ⚙️ Getting Started
 
