@@ -116,8 +116,8 @@ int main() {
 *Compile with: `g++ main.cpp -std=c++20 -O3 -fopenmp -o main*`
 
 
-```
-### 📄 License
+
+# 📄 License
 This project is licensed under the Apache License 2.0.
 
 You may obtain a copy of the license at:
