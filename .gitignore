@@ -1,5 +1,5 @@
 /target/
-**/*.rs.bk
+/benches/
 .Cargo/
 .idea/
 .vscode/
@@ -7,3 +7,6 @@
 Cargo.lock
 .ps1
 .bkp
+.exe
+.txt
+.o

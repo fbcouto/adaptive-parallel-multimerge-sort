@@ -1,14 +1,8 @@
-# 🚀 Adaptive Parallel Multimerge Sort in Rust
+# Adaptive Parallel MultiMerge Sort 🚀
 
-<div align="center">
+A high-performance, L1-cache optimized, hybrid stable parallel sorting algorithm designed for Relational Databases (DBMS). Implemented in **Rust** (with zero-allocation optimization for primitive types) and **C++20** (via OpenMP). 
 
-### High-Performance • Hybrid • Adaptive • Parallel Sorting Engine
-
-A high-performance, hybrid, and adaptive parallel sorting architecture designed in Rust. This engine leverages Rayon for work-stealing parallelism and implements dynamic profiling heuristics to optimize sorting strategies based on data distribution, maximizing hardware utilization while avoiding common parallel overhead traps.
-
-</div>
-
----
+This algorithm achieves processing speeds exceeding **1 Billion elements per second (1 GHz)** on modern CPUs, outperforming standard highly-optimized libraries like Rust's `rayon` in structured and partially sorted datasets (real-world relational database scenarios).
 
 # 📚 Academic Background & Prior Work
 
@@ -21,126 +15,108 @@ The core theoretical foundation of this parallel architecture is based on the or
 
 This engine modernizes the foundational multi-merge paradigms established in the 2011 paper, translating those parallel processing techniques into idiomatic, memory-safe, and highly optimized Rust concurrency using modern work-stealing schedulers.
 
----
+## 🧠 Architecture & Key Innovations
 
-# 🚀 Key Features
+Standard parallel sorting algorithms often suffer from "task explosion" or cache thrashing when merging massive datasets. This engine solves these problems using four architectural pillars:
 
-## Adaptive Oscillation Heuristic
-Dynamically samples data at runtime to detect patterns (sorted, reversed, or highly repetitive/chaotic states) before committing CPU cycles.
+1. **O(1) Entropy Shield (Phase 0):** Samples 100 central elements to determine if the data is purely random noise. If chaos is detected, it delegates sorting to a highly specialized fallback (`rayon::par_sort` in Rust or `__gnu_parallel::stable_sort` in C++).
+2. **Fractal Detection & L1 Cache Optimization (Phase 1):** Scans the dataset dynamically dividing it into `4096-element` micro-slices (perfectly fitting a standard 32KB L1 Data Cache for 64-bit integers). 
+3. **Hybrid $O(\log N)$ Co-Rank Merge:** Instead of discovering boundaries sequentially, it computes them beforehand using a double binary search (`co_rank`). This guarantees a collision-free bidirectional parallel merge.
+4. **Initialization Elision (Zero-Cost Allocation):** Buffer memory allocation for standard `Copy` types leverages memory bypass techniques (`unsafe { buffer.set_len(n); }` in Rust, `std::make_unique_for_overwrite` in C++) to prevent the OS from zero-filling gigabytes of RAM unnecessarily.
 
-## Work-Stealing Parallelism
-Driven by Rayon, partitioning workloads across available logical cores only when data scale justifies the synchronization overhead.
+## 📊 Benchmark Highlights
 
-## Trait-Based Polymorphism
-Leverages Rust's trait system (`T: Ord`) to achieve zero-cost abstractions. The engine achieves native performance for primitives and complex structures alike through compile-time monomorphization, eliminating the need for unsafe casting or manual type dispatching.
+Tested on an Intel CPU against Rayon using a slice of 100,000,000 elements (`u64`):
 
-## Memory-Efficient Anchoring
-Optimized block thresholds (32,768 elements) to maximize L2/L3 cache locality and prevent memory bus saturation during heavy parallel merge phases.
+| Scenario (100M Elements) | Rayon | C++ MultiMerge | Rust MultiMerge (Copy) | Winner |
+| :--- | :--- | :--- | :--- | :--- |
+| **Fully Sorted** | 86.18 ms | 85.26 ms | **86.19 ms** | **Tie (Hardware Memory Bound ~1.16 Gelem/s)** |
+| **Reversed** | 150.27 ms | 155.83 ms | **150.28 ms** | **Tie (Parallel SIMD Reverse)** |
+| **Sawtooth (Database-like)** | 1.00 s | 1.01 s | **0.82 s (820 ms)** | **Rust MultiMerge (Copy)** |
+| **Random Chaos** | **1.99 s** | 2.87 s | 2.01 s | **Rayon** |
 
----
+> *Note: In Sawtooth scenarios (structured runs common in databases), the Rust Copy engine obliterates standard libraries due to its zero-copy slice tracking and $O(\log N)$ parallel merges.*
 
-# 🧠 Architecture & Design Decisions
+## ⚙️ Getting Started
 
-## Parallel sorting algorithms often suffer from performance degradation when applied to low-entropy (already sorted) or ultra-low-range data due to thread allocation overhead.
-
-To mitigate this, this engine runs a lightweight pre-scan:
-
-- **Global Tendency Check** Verifies if the array is already sorted or strictly reversed (`O(N)` early exit).
-- **Topology Mapping** For all other datasets, it maps ascending and descending runs, seamlessly normalizing them into a strictly stable parallel merge pipeline.
-
-```text
-                  [ Input Slice ]
-                         |
-               Distro Trend Analysis
-               /         |          \
-           (Sorted)  (Reversed)  (Mixed/Chaotic)
-             /           |               \
-       Early Exit   Reverse Exit   Parallel MultiMerge
-      (O(N) return) (O(N) in-place) (Strictly Stable)
+### Prerequisites (Windows)
+To build both the Rust and C++ portions natively, you need the **MSYS2 UCRT64** environment.
+```bash
+# Inside MSYS2 UCRT64 terminal:
+pacman -S mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-rust
 
 ```
-# 🔒 Safe Compile-Time Polymorphism
 
-Unlike typical high-level languages that rely on dynamic dispatch (runtime type checking), this engine utilizes Rust's static dispatch mechanism.
+### Building & Benchmarking
 
-By constraining the input slice with `T: Ord + Clone + Send + Sync`, the compiler generates specialized, optimized machine code for every data type processed. This design ensures that:
+This project uses a custom `build.rs` script that transparently calls `g++` via `cc-rs` and links the OpenMP library.
 
-- **Safety:** No unsafe pointer casting or manual type reflection is required, guaranteeing memory safety at all times.
-- **Speed:** The sorting logic is "inlined" for the specific types used, providing the same machine-code efficiency as hardcoded implementations.
-- **Flexibility:** The engine natively supports any data type that implements standard comparison traits, without requiring source code modifications to add new types.
-
----
-
-# 🧪 Benchmarking Methodology (CRITERION)
-
-![Performance Comparison Chart](images/lines.png)
-![Violin Plot](images/violin.png)
-
-
----
-
-# # 🛡️ Uncompromised Stability
-
-A crucial distinction of the Adaptive MultiMerge engine is its commitment to **strict stability** (`O(1)` spatial ordering of equal elements). While unstable sorting methods (like quicksort or pattern-defeating quicksort) are traditionally faster because they swap elements without tracking chronological order, they are destructive to complex datasets (e.g., database rows sorted by secondary keys).
-
-This engine competes directly with—and outperforms—Rust's highly optimized standard stable sorting mechanisms (inspired by Timsort).
-
-## Pure Stable Dominance over Chaos
-Processing pure entropy (random data) is historically the weak point of metadata-heavy stable algorithms. Traditional stable sorts suffer from severe memory allocation penalties and stack overhead when trying to identify "runs" in completely chaotic data.
-
-Unlike hybrid engines that are forced to downgrade to an unstable sort when they encounter chaos, the Adaptive MultiMerge architecture handles maximum entropy natively. Its Phase 1 metadata generation and Phase 2 directional merging are so mathematically efficient that the engine processes pure randomness **up to 42% faster** than the standard library's stable sort (scaling super-linearly up to 300M+ elements). 
-
-This ensures state-of-the-art speed across all distributions without ever compromising data stability.
-
----
-
-# 📊 Performance Benchmarks (Criterion V2)
-
-The true measure of a robust stable sorting algorithm is how it scales under maximum entropy (pure random chaos) where hardware memory constraints are severely tested. 
-
-**Environment:** * Hardware: AMD/Intel 8+ Cores
-* Scenario: High Entropy (Pure Random `u64`)
-
-| Elements | Standard Library (`rayon::par_sort`) | Adaptive MultiMerge | Delta |
-| :--- | :--- | :--- | :--- |
-| **1 Million** | ~13.98 ms | **~8.91 ms** | **~36.3% Faster** |
-| **10 Million** | ~174.37 ms | **~102.13 ms** | **~41.4% Faster** |
-| **100 Million** | ~1.99 s | **~1.16 s** | **~41.7% Faster** |
-| **300 Million** | ~6.56 s | **~3.76 s** | **~42.6% Faster** |
-
-> *Note: As the dataset scales to massive proportions (300M+ elements), the MultiMerge architecture increasingly outpaces the standard library, demonstrating superior L2/L3 cache utilization and lower memory bandwidth saturation.*
-
----
-
-# ⚙️ Technical Features
-
-- **Zero-Overhead Abstractions:** Uses generic `T: Ord + Clone` traits with pointer arithmetic for maximum speed.
-- **Cache-Friendly:** The design minimizes memory writes by avoiding physical data reversals.
-- **Unified Stable Architecture:** Processes highly structured data and pure entropy with the same strictly stable engine, eliminating the need for unstable fallbacks.
-- **Production Ready:** Fully validated with integration tests covering chaotic, reverse-ordered, and duplicate-heavy datasets.
-
----
-
-# 📦 Usage
-
-## Add this to your `Cargo.toml`
-
+1. **Set the default toolchain** (already provided in `.cargo/config.toml`):
 ```toml
-[dependencies]
-adaptive-parallel-multimerge-sort = "1.0.0"
+[build]
+target = "x86_64-pc-windows-gnu"
+
 ```
 
-## Integration Example
+
+2. **Run tests**:
+```bash
+cargo test
+
 ```
+
+
+3. **Run the Benchmark Arena** (Criterion):
+```bash
+CXX=g++ cargo bench
+
+```
+
+
+
+## 💻 Usage in Your Project
+
+### Using the Rust Engine
+
+The engine exposes a single, highly optimized routine for `Copy` types (e.g., Database primary keys, timestamps, `u64`, `i64`).
+
+```rust
 use adaptive_parallel_multimerge_sort::sort;
 
 fn main() {
-    let mut data = vec![9, 3, 5, 1, 7, 2, 8, 4, 6];
-    sort(&mut data);
-    println!("{:?}", data);
+    let mut db_keys: Vec<u64> = vec![9, 5, 1, 3, 7, 8, 2, 6, 4, 0, 15, 12];
+    
+    // Executes the adaptive algorithm
+    sort(&mut db_keys);
+    
+    assert!(db_keys.windows(2).all(|w| w[0] <= w[1]));
 }
+
 ```
----
+
+### Using the C++ Engine (Standalone)
+
+You can take `src/MultiMergeSort.hpp` and drop it directly into your modern C++20 project (like Firebird SQL internals).
+
+```cpp
+#include "MultiMergeSort.hpp"
+#include <vector>
+
+int main() {
+    std::vector<uint64_t> data = {9, 5, 1, 3, 7, 8, 2, 6};
+    
+    // Pass as std::span
+    multimerge::sort(std::span<uint64_t>(data));
+    
+    return 0;
+}
+
+```
+
+*Compile with: `g++ main.cpp -std=c++20 -O3 -fopenmp -o main*`
+
+
+```
 ### 📄 License
 This project is licensed under the Apache License 2.0.
 

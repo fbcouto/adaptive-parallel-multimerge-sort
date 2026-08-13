@@ -1,5 +1,7 @@
 use adaptive_parallel_multimerge_sort::sort as multi_merge;
+use adaptive_parallel_multimerge_sort::cpp_sort_u64; // <- IMPORT NOVO
 use criterion::{black_box, criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput};
+use adaptive_parallel_multimerge_sort::multi_merge_sort_copy;
 use rand::{thread_rng, Rng};
 use rayon::prelude::*;
 use std::time::Duration;
@@ -59,8 +61,9 @@ fn generate_low_cardinality(size: usize) -> Vec<u64> {
 
 fn bench_final_arena(c: &mut Criterion) {
     let sizes = [
-       1_000_000,  //, 10_000_000
-       100_000_000
+       //1_000_000,  //, 
+       3_000_000
+       //,100_000_000
     // 300_000_000
     ];
 
@@ -69,7 +72,7 @@ fn bench_final_arena(c: &mut Criterion) {
         ("Scenario_Reversed", generate_reversed as fn(usize) -> Vec<u64>),
         ("Scenario_Random", generate_random as fn(usize) -> Vec<u64>),
         ("Scenario_Sawtooth_1000", generate_sawtooth as fn(usize) -> Vec<u64>),
-        ("Scenario_LowCardinality", generate_low_cardinality as fn(usize) -> Vec<u64>),
+       // ("Scenario_LowCardinality", generate_low_cardinality as fn(usize) -> Vec<u64>),
     ];
 
     for (scenario_name, generator) in scenarios.iter() {
@@ -99,14 +102,31 @@ fn bench_final_arena(c: &mut Criterion) {
                 )
             });
 
-            // 2. Sua engine -- sempre estavel, em qualquer cenario, incluindo
-            // Random e LowCardinality.
-            group.bench_with_input(BenchmarkId::new("2_MultiMerge_Stable", size), &size, |b, _| {
+ 
+            // 2. Sua engine em Rust
+            group.bench_with_input(BenchmarkId::new("2_MultiMerge_Stable_Rust", size), &size, |b, _| {
                 b.iter_batched(
                     || base_data.clone(),
                     |mut d| multi_merge(black_box(&mut d)),
                     BatchSize::LargeInput,
                 )
+            });
+
+            // 3. Sua engine Híbrida C++ (OpenMP + L1 Cache)
+            group.bench_with_input(BenchmarkId::new("3_MultiMerge_Stable_Cpp", size), &size, |b, _| {
+                b.iter_batched(
+                    || base_data.clone(),
+                    |mut d| cpp_sort_u64(black_box(&mut d)), // Chamada FFI C++
+                    BatchSize::LargeInput,
+                )
+            });
+
+            group.bench_with_input(BenchmarkId::new("4_MultiMerge_Stable_Rust_Copy", size), &size, |b, _| {
+                b.iter_batched(
+                    || base_data.clone(),
+                    |mut d| multi_merge_sort_copy(black_box(&mut d)),
+                    BatchSize::LargeInput,
+              )
             });
         }
         group.finish();
