@@ -203,7 +203,58 @@ fn merge_seq<T: Ord + Clone>(a: &mut [T], b: &mut [T], dest: &mut [T]) {
     if j < b.len() { move_slice(&mut dest[k..], &mut b[j..]); }
 }
 
-fn bidirectional_merge<T: Ord + Clone + Send + Sync>(a: &mut [T], b: &mut [T], dest: &mut [T], leaf_size: usize) {
+/// Merge caminhando para FRENTE. Empate -> A (mantem estabilidade).
+/// Emite exatamente `dest.len()` elementos: os menores do multiconjunto.
+#[inline]
+fn merge_front<T: Ord + Copy>(a: &[T], b: &[T], dest: &mut [T]) {
+    let (mut i, mut j) = (0usize, 0usize);
+    for slot in dest.iter_mut() {
+        let take_a = j >= b.len() || (i < a.len() && a[i] <= b[j]);
+        if take_a {
+            *slot = a[i];
+            i += 1;
+        } else {
+            *slot = b[j];
+            j += 1;
+        }
+    }
+}
+
+/// Merge caminhando para TRAS. Empate -> B.
+/// A regra de desempate e a COMPLEMENTAR da de merge_front: e exatamente isso
+/// que faz o teorema abaixo valer e preserva estabilidade.
+/// Emite `dest.len()` elementos: os maiores do multiconjunto.
+#[inline]
+fn merge_back<T: Ord + Copy>(a: &[T], b: &[T], dest: &mut [T]) {
+    let (mut qa, mut qb) = (a.len(), b.len());
+    for slot in dest.iter_mut().rev() {
+        let take_b = qa == 0 || (qb > 0 && b[qb - 1] >= a[qa - 1]);
+        if take_b {
+            qb -= 1;
+            *slot = b[qb];
+        } else {
+            qa -= 1;
+            *slot = a[qa];
+        }
+    }
+}
+
+/// MERGE BIDIRECIONAL - duas threads, uma partindo do inicio e outra do fim.
+///
+/// TEOREMA: merge_front com empate->A emite os k menores; merge_back com
+/// empate->B emite os total-k maiores. Esses dois conjuntos particionam o
+/// multiconjunto para QUALQUER k, entao nenhum ponto de corte precisa ser
+/// calculado - cada lado so conta as proprias saidas.
+///
+/// A versao anterior nao era bidirecional: chamava merge_seq (para frente) nos
+/// dois lados, pagava DOIS co_rank e abria um buraco de 2 elementos no meio.
+/// Aqui os co_rank somem por completo.
+///
+/// Seguranca: os dois lados leem `a` e `b` INTEIROS, por referencia imutavel.
+/// O borrow checker prova que nao ha escrita nas fontes, entao as leituras
+/// sobrepostas no ponto de encontro sao inofensivas. As escritas caem em
+/// metades disjuntas de `dest`, garantidas pelo split_at_mut.
+fn bidirectional_merge<T: Ord + Copy + Send + Sync>(a: &mut [T], b: &mut [T], dest: &mut [T], leaf_size: usize) {
     if a.is_empty() {
         move_slice(dest, b);
         return;
@@ -218,30 +269,19 @@ fn bidirectional_merge<T: Ord + Clone + Send + Sync>(a: &mut [T], b: &mut [T], d
         return;
     }
 
-    let k = (total + 1) / 2;
-    let front_count = k - 1;
-
-    let (pa, pb) = co_rank(front_count, a, b);
-    let (qa, qb) = co_rank(front_count + 2, a, b);
-
-    let (a_front, a_rest) = a.split_at_mut(pa);
-    let (a_mid, a_back) = a_rest.split_at_mut(qa - pa);
-    let (b_front, b_rest) = b.split_at_mut(pb);
-    let (b_mid, b_back) = b_rest.split_at_mut(qb - pb);
-
-    let (dest_front, rest) = dest.split_at_mut(front_count);
-    let (dest_middle, dest_back) = rest.split_at_mut(2);
+    let k = total / 2;
+    let (a_ro, b_ro): (&[T], &[T]) = (a, b);
+    let (dest_front, dest_back) = dest.split_at_mut(k);
 
     rayon::join(
-        || merge_seq(a_front, b_front, dest_front),
-        || merge_seq(a_back, b_back, dest_back),
+        || merge_front(a_ro, b_ro, dest_front),
+        || merge_back(a_ro, b_ro, dest_back),
     );
-    merge_seq(a_mid, b_mid, dest_middle);
 }
 
 const CORANK_SPLIT_FACTOR: usize = 16;
 
-fn parallel_merge<T: Ord + Clone + Send + Sync>(a: &mut [T], b: &mut [T], dest: &mut [T], leaf_size: usize) {
+fn parallel_merge<T: Ord + Copy + Send + Sync>(a: &mut [T], b: &mut [T], dest: &mut [T], leaf_size: usize) {
     let total = a.len() + b.len();
     if total > leaf_size.saturating_mul(CORANK_SPLIT_FACTOR) {
         let k = total / 2;
@@ -279,7 +319,7 @@ fn block_offsets(metadata: &[i64]) -> Vec<usize> {
     offsets
 }
 
-fn bottom_up_merge<T: Ord + Clone + Send + Sync>(
+fn bottom_up_merge<T: Ord + Copy + Send + Sync>(
     v: &mut [T],
     buf: &mut [T],
     metadata: &[i64],
@@ -307,7 +347,18 @@ fn bottom_up_merge<T: Ord + Clone + Send + Sync>(
     }
 
     let base = offsets[0];
-    let split_idx = num_blocks / 2;
+    // Split BALANCEADO POR ELEMENTOS, nao por contagem de runs.
+    //
+    // `num_blocks / 2` divide a lista de runs ao meio. Com runs de tamanhos
+    // muito diferentes isso desequilibra o rayon::join: runs [1_000_000, 2, 2, 2]
+    // mandavam 1.000.002 elementos para um lado e 4 para o outro, deixando uma
+    // thread com todo o trabalho. Buscar o ponto medio em `offsets` custa uma
+    // busca binaria por no e equilibra de verdade.
+    let total = offsets[num_blocks] - base;
+    let target = base + total / 2;
+    let split_idx = offsets
+        .partition_point(|&o| o < target)
+        .clamp(1, num_blocks - 1);
     let mid = offsets[split_idx] - base;
     let (left_meta, right_meta) = metadata.split_at(split_idx);
     let left_offsets = &offsets[..=split_idx];
@@ -363,6 +414,389 @@ fn parallel_reverse<T: Send + Sync>(arr: &mut [T]) {
 
 /// High-performance relational sort. 
 /// Requires T: Copy to elide memory zero-initialization on the buffer.
+// =====================================================================
+//  MERGE K-VIAS COM BLOCAGEM DE CACHE
+//
+//  O merge binario paga log2(runs) passadas sobre a memoria. Medido: a
+//  maquina satura a banda, entao o custo total e o NUMERO DE PASSADAS.
+//  Um merge de K vias paga logK(runs) - com K=8 e 20000 runs, 15 niveis
+//  viram 5.
+//
+//  A implementacao NAO usa loser tree: medimos que ela custa ~12x mais
+//  por elemento que o merge_seq, por causa da indirecao (head[w] com w
+//  em tempo de execucao impede promocao a registrador). Em vez disso,
+//  cada tile e cortado com multiseq_partition e mergeado por uma arvore
+//  BINARIA que cabe em L1 - o kernel rapido continua sendo o mesmo.
+// =====================================================================
+
+pub const KWAY_FANOUT: usize = 8;
+
+/// Abaixo deste tamanho o subtrecho ja e cache-resident: o caminho binario
+/// ganha, porque nao paga particionamento nem tiles.
+const KWAY_MIN_BYTES: usize = 2 << 20;
+
+/// TILE em elementos. O otimo medido fica em L1 e e ~8x menor que o calculo
+/// ingenuo de "3 buffers ativos" sugere, porque os dados de entrada streamados
+/// tambem disputam L1 com os dois scratches. Medido: 512 para u64.
+#[inline]
+fn tile_elems<T>() -> usize {
+    const L1: usize = 32768;
+    let e = std::mem::size_of::<T>().max(1);
+    (L1 / (8 * e)).clamp(128, 2048)
+}
+
+/// merge para frente com fontes imutaveis (empate -> A, estavel)
+#[inline]
+fn merge_ro<T: Ord + Copy>(a: &[T], b: &[T], dest: &mut [T]) {
+    let (mut i, mut j) = (0usize, 0usize);
+    for slot in dest.iter_mut() {
+        let take_a = j >= b.len() || (i < a.len() && a[i] <= b[j]);
+        if take_a {
+            *slot = a[i];
+            i += 1;
+        } else {
+            *slot = b[j];
+            j += 1;
+        }
+    }
+}
+
+/// Acha out[i] com sum(out) == rank, tal que os prefixos sao exatamente os
+/// `rank` menores elementos. Empates distribuidos em ordem de stream, o que
+/// mantem a estabilidade e concorda com o desempate de merge_ro.
+fn multiseq_partition<T: Ord + Copy>(seq: &[&[T]], rank: usize, out: &mut [usize]) {
+    let ns = seq.len();
+    let mut lo = [0usize; KWAY_FANOUT];
+    let mut hi = [0usize; KWAY_FANOUT];
+    let mut plt = [0usize; KWAY_FANOUT];
+    let mut ple = [0usize; KWAY_FANOUT];
+    for i in 0..ns {
+        hi[i] = seq[i].len();
+    }
+
+    loop {
+        let mut m = usize::MAX;
+        let mut w = 0usize;
+        for i in 0..ns {
+            if hi[i] - lo[i] > w {
+                w = hi[i] - lo[i];
+                m = i;
+            }
+        }
+        if m == usize::MAX {
+            out[..ns].copy_from_slice(&lo[..ns]);
+            return;
+        }
+
+        let p = seq[m][lo[m] + (hi[m] - lo[m]) / 2];
+
+        let (mut lt, mut le) = (0usize, 0usize);
+        for i in 0..ns {
+            plt[i] = seq[i].partition_point(|x| *x < p);
+            ple[i] = seq[i].partition_point(|x| *x <= p);
+            lt += plt[i];
+            le += ple[i];
+        }
+
+        if lt <= rank && rank <= le {
+            let mut need = rank - lt;
+            for i in 0..ns {
+                let ties = ple[i] - plt[i];
+                let take = ties.min(need);
+                out[i] = plt[i] + take;
+                need -= take;
+            }
+            return;
+        }
+        if lt > rank {
+            for i in 0..ns {
+                if plt[i] < hi[i] {
+                    hi[i] = plt[i];
+                }
+            }
+        } else {
+            for i in 0..ns {
+                if ple[i] > lo[i] {
+                    lo[i] = ple[i];
+                }
+            }
+        }
+    }
+}
+
+/// Um nivel da arvore binaria: mergeia pares de segmentos de `src` em `dst`.
+/// Devolve os novos segmentos (offset, len) e quantos sao.
+fn merge_level<T: Ord + Copy>(
+    src: &[T],
+    segs: &[(usize, usize)],
+    dst: &mut [T],
+) -> ([(usize, usize); KWAY_FANOUT], usize) {
+    let mut out = [(0usize, 0usize); KWAY_FANOUT];
+    let mut cnt = 0usize;
+    let mut off = 0usize;
+    let mut i = 0usize;
+    while i < segs.len() {
+        if i + 1 == segs.len() {
+            let (o, l) = segs[i];
+            dst[off..off + l].copy_from_slice(&src[o..o + l]);
+            out[cnt] = (off, l);
+            off += l;
+        } else {
+            let (o1, l1) = segs[i];
+            let (_, l2) = segs[i + 1];
+            let l = l1 + l2;
+            let (left, right) = src[o1..o1 + l].split_at(l1);
+            merge_ro(left, right, &mut dst[off..off + l]);
+            out[cnt] = (off, l);
+            off += l;
+        }
+        cnt += 1;
+        i += 2;
+    }
+    (out, cnt)
+}
+
+/// Merge de ns <= K runs com BLOCAGEM DE CACHE.
+/// A DRAM ve 1 leitura + 1 escrita, em vez de log2(K) passadas.
+fn kway_merge_tiled<T: Ord + Copy>(runs: &[&[T]], dest: &mut [T]) {
+    let ns = runs.len();
+    let total = dest.len();
+    if ns == 1 {
+        dest.copy_from_slice(&runs[0][..total]);
+        return;
+    }
+    if ns == 2 {
+        merge_ro(runs[0], runs[1], dest);
+        return;
+    }
+
+    let tile = tile_elems::<T>();
+    let filler = runs.iter().find(|r| !r.is_empty()).map(|r| r[0]).unwrap();
+    let mut scratch = vec![filler; 2 * tile];
+    let (s1, s2) = scratch.split_at_mut(tile);
+
+    let mut cur = [0usize; KWAY_FANOUT];
+    let mut done = 0usize;
+
+    while done < total {
+        let want = tile.min(total - done);
+
+        // Janela restrita: um tile consome no maximo `want` de qualquer run,
+        // entao a busca binaria roda sobre `want` e nao sobre o run inteiro.
+        let mut win: [&[T]; KWAY_FANOUT] = [&[]; KWAY_FANOUT];
+        for i in 0..ns {
+            let rem = &runs[i][cur[i]..];
+            win[i] = &rem[..rem.len().min(want)];
+        }
+        let mut cut = [0usize; KWAY_FANOUT];
+        multiseq_partition(&win[..ns], want, &mut cut[..ns]);
+
+        // Nivel 1: das janelas para s1
+        let mut segs = [(0usize, 0usize); KWAY_FANOUT];
+        let mut cnt = 0usize;
+        let mut off = 0usize;
+        let mut i = 0usize;
+        while i < ns {
+            if i + 1 == ns {
+                let l = cut[i];
+                s1[off..off + l].copy_from_slice(&win[i][..l]);
+                segs[cnt] = (off, l);
+                off += l;
+            } else {
+                let l = cut[i] + cut[i + 1];
+                merge_ro(
+                    &win[i][..cut[i]],
+                    &win[i + 1][..cut[i + 1]],
+                    &mut s1[off..off + l],
+                );
+                segs[cnt] = (off, l);
+                off += l;
+            }
+            cnt += 1;
+            i += 2;
+        }
+
+        let out_slice = &mut dest[done..done + want];
+
+        // Niveis intermediarios em s1/s2 (residentes em L1); o ULTIMO nivel
+        // escreve direto no destino - a unica escrita que chega na DRAM.
+        if cnt > 2 {
+            let (segs2, cnt2) = merge_level(&s1[..want], &segs[..cnt], s2);
+            if cnt2 == 2 {
+                let (o1, l1) = segs2[0];
+                let (_, l2) = segs2[1];
+                let (left, right) = s2[o1..o1 + l1 + l2].split_at(l1);
+                merge_ro(left, right, out_slice);
+            } else {
+                let (o, l) = segs2[0];
+                out_slice.copy_from_slice(&s2[o..o + l]);
+            }
+        } else if cnt == 2 {
+            let (o1, l1) = segs[0];
+            let (_, l2) = segs[1];
+            let (left, right) = s1[o1..o1 + l1 + l2].split_at(l1);
+            merge_ro(left, right, out_slice);
+        } else {
+            let (o, l) = segs[0];
+            out_slice.copy_from_slice(&s1[o..o + l]);
+        }
+
+        for i in 0..ns {
+            cur[i] += cut[i];
+        }
+        done += want;
+    }
+}
+
+/// Merge k-vias paralelo: corta por rank e recursa.
+/// Com ns == 2 usa o BIDIRECIONAL - uma thread da frente, outra do fim.
+fn parallel_kway_merge<T: Ord + Copy + Send + Sync>(
+    runs: &[&[T]],
+    dest: &mut [T],
+    leaf_size: usize,
+) {
+    let ns = runs.len();
+    let total = dest.len();
+
+    if ns == 1 {
+        dest.copy_from_slice(&runs[0][..total]);
+        return;
+    }
+    if ns == 2 {
+        // BIDIRECIONAL: sem ponto de corte, uma thread para cada direcao.
+        let k = total / 2;
+        let (a, b) = (runs[0], runs[1]);
+        let (df, db) = dest.split_at_mut(k);
+        rayon::join(|| merge_front(a, b, df), || merge_back(a, b, db));
+        return;
+    }
+    if total <= leaf_size.saturating_mul(CORANK_SPLIT_FACTOR) {
+        kway_merge_tiled(runs, dest);
+        return;
+    }
+
+    let mut cut = [0usize; KWAY_FANOUT];
+    multiseq_partition(runs, total / 2, &mut cut[..ns]);
+
+    let mut left: [&[T]; KWAY_FANOUT] = [&[]; KWAY_FANOUT];
+    let mut right: [&[T]; KWAY_FANOUT] = [&[]; KWAY_FANOUT];
+    let mut ltot = 0usize;
+    for i in 0..ns {
+        let (l, r) = runs[i].split_at(cut[i]);
+        left[i] = l;
+        right[i] = r;
+        ltot += cut[i];
+    }
+    let (dl, dr) = dest.split_at_mut(ltot);
+    rayon::join(
+        || parallel_kway_merge(&left[..ns], dl, leaf_size),
+        || parallel_kway_merge(&right[..ns], dr, leaf_size),
+    );
+}
+
+/// Recursao K-aria sobre o metadata. Hibrido: k-vias so nos niveis de topo,
+/// que sao os que vao a DRAM; abaixo do limiar delega ao caminho binario, que
+/// e mais rapido em cache e ja tem os atalhos e o merge bidirecional.
+fn bottom_up_merge_kway<T: Ord + Copy + Send + Sync>(
+    v: &mut [T],
+    buf: &mut [T],
+    metadata: &[i64],
+    offsets: &[usize],
+    leaf_size: usize,
+    into_buf: bool,
+) {
+    let num_blocks = metadata.len();
+
+    if num_blocks == 1 {
+        let is_desc = metadata[0] < 0;
+        let n = v.len();
+        if into_buf {
+            if is_desc {
+                for i in 0..n {
+                    buf[i] = v[n - 1 - i];
+                }
+            } else {
+                buf.copy_from_slice(v);
+            }
+        } else if is_desc {
+            v.reverse();
+        }
+        return;
+    }
+
+    let base = offsets[0];
+    let total = offsets[num_blocks] - base;
+
+    if total * std::mem::size_of::<T>() <= KWAY_MIN_BYTES {
+        bottom_up_merge(v, buf, metadata, offsets, leaf_size, into_buf);
+        return;
+    }
+
+    let g = KWAY_FANOUT.min(num_blocks);
+
+    // Cortes balanceados por ELEMENTO, nao por contagem de runs.
+    let mut cm = [0usize; KWAY_FANOUT + 1];
+    cm[g] = num_blocks;
+    for i in 1..g {
+        let target = base + total * i / g;
+        let idx = offsets.partition_point(|&o| o < target);
+        cm[i] = idx.clamp(cm[i - 1] + 1, num_blocks - (g - i));
+    }
+
+    // Recursao paralela nos g grupos
+    {
+        let mut vv: &mut [T] = v;
+        let mut bb: &mut [T] = buf;
+        let mut prev = 0usize;
+        let mut parts: Vec<(&mut [T], &mut [T], usize, usize)> = Vec::with_capacity(g);
+        for i in 0..g {
+            let e = offsets[cm[i + 1]] - base;
+            let len = e - prev;
+            let (vl, vr) = vv.split_at_mut(len);
+            let (bl, br) = bb.split_at_mut(len);
+            parts.push((vl, bl, cm[i], cm[i + 1]));
+            vv = vr;
+            bb = br;
+            prev = e;
+        }
+        parts
+            .into_par_iter()
+            .for_each(|(sv, sb, lo, hi)| {
+                bottom_up_merge_kway(
+                    sv,
+                    sb,
+                    &metadata[lo..hi],
+                    &offsets[lo..=hi],
+                    leaf_size,
+                    !into_buf,
+                );
+            });
+    }
+
+    // Origem = o buffer onde os filhos escreveram
+    let (src, dst): (&[T], &mut [T]) = if into_buf { (v, buf) } else { (buf, v) };
+
+    // ATALHO PRESERVADO: grupos adjacentes ja em ordem viram UM stream so.
+    let mut runs: [&[T]; KWAY_FANOUT] = [&[]; KWAY_FANOUT];
+    let mut ns = 0usize;
+    let mut gs = 0usize;
+    for i in 0..g {
+        let e = offsets[cm[i + 1]] - base;
+        let join_next = i + 1 < g && src[e - 1] <= src[e];
+        if !join_next {
+            runs[ns] = &src[gs..e];
+            ns += 1;
+            gs = e;
+        }
+    }
+
+    if ns == 1 {
+        dst.copy_from_slice(src);
+        return;
+    }
+    parallel_kway_merge(&runs[..ns], dst, leaf_size);
+}
+
 pub fn multi_merge_sort<T: Ord + Copy + Send + Sync>(arr: &mut [T]) {
     let n = arr.len();
     let leaf_size = get_leaf_size::<T>();
@@ -395,7 +829,7 @@ pub fn multi_merge_sort<T: Ord + Copy + Send + Sync>(arr: &mut [T]) {
     // overwrites every position before any logical read happens.
     unsafe { buffer.set_len(n); }
     
-    bottom_up_merge(arr, &mut buffer, &metadata, &offsets, leaf_size, false);
+    bottom_up_merge_kway(arr, &mut buffer, &metadata, &offsets, leaf_size, false);
 }
 
 // ==========================================

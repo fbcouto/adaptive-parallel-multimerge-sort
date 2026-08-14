@@ -2,7 +2,9 @@
 
 A high-performance, L1-cache optimized, hybrid stable parallel sorting algorithm designed for Relational Databases (DBMS). Implemented in **Rust** (with zero-allocation optimization for primitive types) and **C++20** (via OpenMP). 
 
-This algorithm achieves processing speeds exceeding **1 Billion elements per second (1 GHz)** on modern CPUs, outperforming standard highly-optimized libraries like Rust's `rayon` in structured and partially sorted datasets (real-world relational database scenarios).
+The algorithm is built on a single observation: real database keys are almost never random. They arrive as long monotone stretches — an index being rebuilt, sorted segments being consolidated, a table appended in insertion order. A general-purpose sort throws that structure away and pays `n log n` regardless. This engine detects the structure first, in one linear pass, and only sorts what actually needs sorting.
+
+On structured datasets it exceeds **1 Gelem/s** (one billion elements per second) on modern CPUs, and it outperforms highly-optimized libraries such as Rust's `rayon` on data containing many overlapping runs — the real-world relational database scenario.
 
 # 📚 Academic Background & Prior Work
 
@@ -17,12 +19,64 @@ This engine modernizes the foundational multi-merge paradigms established in the
 
 ## 🧠 Architecture & Key Innovations
 
-Standard parallel sorting algorithms often suffer from "task explosion" or cache thrashing when merging massive datasets. This engine solves these problems using four architectural pillars:
+The engine runs in two phases: a linear **detection** pass that discovers the structure already present in the data, and a **merge** phase that only does the work that structure leaves behind. Five design decisions carry the algorithm.
 
-1. **O(1) Entropy Shield (Phase 0):** Samples 100 central elements to determine if the data is purely random noise. If chaos is detected, it delegates sorting to a highly specialized fallback (`rayon::par_sort` in Rust or `__gnu_parallel::stable_sort` in C++).
-2. **Fractal Detection & L1 Cache Optimization (Phase 1):** Scans the dataset dynamically dividing it into `4096-element` micro-slices (perfectly fitting a standard 32KB L1 Data Cache for 64-bit integers). 
-3. **Hybrid $O(\log N)$ Co-Rank Merge:** Instead of discovering boundaries sequentially, it computes them beforehand using a double binary search (`co_rank`). This guarantees a collision-free bidirectional parallel merge.
-4. **Initialization Elision (Zero-Cost Allocation):** Buffer memory allocation for standard `Copy` types leverages memory bypass techniques (`unsafe { buffer.set_len(n); }` in Rust, `std::make_unique_for_overwrite` in C++) to prevent the OS from zero-filling gigabytes of RAM unnecessarily.
+### 1. O(1) Entropy Shield (Phase 0)
+
+Before anything else, the engine samples roughly 100 consecutive elements near the midpoint of the array and counts direction changes. If the sample looks like noise, there is no structure to exploit and the run detector would only waste memory building metadata for millions of two-element runs. In that case the engine bails out immediately to a specialized parallel fallback: `rayon::par_sort` in Rust, and either `__gnu_parallel::stable_sort` or the internal `chunk_parallel_sort` in C++, selected at build time.
+
+This is a constant-cost bet made on a small sample. It is cheap by design — the cost of being wrong is bounded by the fallback, which is a competent parallel sort in its own right.
+
+### 2. Overlapping Block Detection & the Metadata Monoid (Phase 1)
+
+This is the core of the algorithm.
+
+The array is divided into blocks that **overlap by exactly one element**. Each block is scanned independently and in parallel for monotone runs, and each run is recorded as a single signed integer: positive for ascending, negative for descending. Nothing is moved; the pass is read-only.
+
+The one-element overlap is not an implementation detail — it is what makes the whole scheme work. With blocks `[0,11)`, `[10,21)`, `[20,30)`, every adjacent-pair comparison in the array belongs to **exactly one** block: no gaps, no duplicates. Without the overlap, the comparison straddling each boundary would belong to no block at all, and stitching would require a second pass that reads the array again.
+
+Because of that, joining two blocks' metadata is a **pure algebraic operation on the metadata alone** — the array is never touched:
+
+- Same sign → the runs are contiguous and monotone through the shared element, so they merge into one run of length `a + b - 1` (the shared element was counted twice).
+- Different signs → the shared element is a peak or a valley. It stays with the left run, and the right run loses one.
+- A block reporting a single element is the shared element itself, and is absorbed by its neighbour.
+
+The operation is associative, so it composes as a **monoid under a parallel reduce**, and the identical function stitches micro-blocks into macro-blocks and macro-blocks into the final result. The metadata is self-describing: the lengths encode everything needed to join, so no absolute positions have to be carried through the reduction.
+
+If the whole array collapses to a single run, the answer is immediate: positive means it was already sorted and the engine returns without writing a byte; negative means one parallel reverse and it is done.
+
+**One asymmetry is load-bearing.** Ascending runs are detected with `<=` and descending runs with a strict `>`. Equal elements therefore always fall into ascending runs, which makes every descending run *strictly* decreasing — and reversing a strictly decreasing sequence cannot swap two equal elements. That is what keeps the reverse path stable.
+
+### 3. Bidirectional Merge
+
+Two workers merge the same pair of runs simultaneously: one walks **forward from the start**, one walks **backward from the end**, and they meet in the middle.
+
+They never collide, and no partition point has to be computed:
+
+> A forward merge that breaks ties toward the left run emits exactly the `k` smallest elements in order. A backward merge that breaks ties toward the right run emits exactly the `total - k` largest. For **any** `k`, those two sets partition the multiset.
+
+Each side simply counts its own output and stops. The complementary tie-breaking rules — left-wins going forward, right-wins going backward — are what make the theorem hold and what preserve stability at the same time.
+
+In Rust this falls out of the type system: both halves borrow the source runs immutably and write into disjoint halves of the destination via `split_at_mut`, so the compiler proves the absence of a data race with no `unsafe` and no special cases.
+
+### 4. Cache-Blocked K-Way Merge
+
+Merging `k` sorted runs with a binary tree costs `log₂(k)` full passes over memory. On a bandwidth-saturated machine that pass count — not the comparison count — is what determines the runtime. An 8-way merge costs `log₈(k)` passes instead: for 30,000 runs, 5 levels rather than 15.
+
+The k-way merge is **not** implemented with a loser tree. A loser tree indexes its stream heads with a value only known at runtime, which prevents the compiler from keeping them in registers; measured against the plain binary kernel it cost roughly an order of magnitude more per element, erasing the entire benefit of fewer passes.
+
+Instead, each output tile is partitioned across all `k` runs with **multi-sequence selection**, and the tile is then merged by an ordinary binary tree running **entirely inside L1**. Only the final level writes to the destination, so DRAM sees one read and one write per k-way level while the inner loop keeps the fast, register-resident binary kernel.
+
+The strategy is **hybrid by size**: k-way applies only above a threshold where a merge exceeds cache. Below it, the binary path is faster — it has no partitioning overhead, it keeps the shortcut that turns an already-ordered merge into a copy, and it is where the bidirectional merge operates. Adjacent groups that are already in order are coalesced into a single stream before merging, so the shortcut survives k-way as well.
+
+### 5. Initialization Elision
+
+The scratch buffer for `Copy` types is allocated without being zero-filled (`unsafe { buffer.set_len(n) }` in Rust, `std::make_unique_for_overwrite` in C++). Every position is written by the merge before it is ever read, so the OS is never asked to zero gigabytes of RAM that are about to be overwritten.
+
+### Stability
+
+The engine is **stable end to end**, and every phase is built to keep it that way: strictly-decreasing runs make reversal safe, complementary tie-breaking makes the bidirectional merge safe, and multi-sequence selection distributes tied elements in stream order so that the parallel partition and the sequential merge agree on the same total order.
+
 
 
 ## 📊 Benchmark Highlights

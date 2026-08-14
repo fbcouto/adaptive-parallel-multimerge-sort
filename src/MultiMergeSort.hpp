@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <omp.h> 
 #include <memory>
+#include <type_traits>
 
 #ifdef MULTIMERGE_USE_GNU_PARALLEL
 #include <parallel/algorithm>
@@ -112,10 +113,15 @@ namespace multimerge {
         const size_t micro_slice_len = 4096;
         
         if (n <= micro_slice_len) {
-            if (evaluate_local_entropy(arr)) {
-                std::stable_sort(arr.begin(), arr.end());
-                return { static_cast<int64_t>(n) };
+            // OVERLAP CONTRACT: arr[0] and arr[n-1] are shared with the
+            // neighbouring blocks, which may already have measured them (and,
+            // at macro level, may be measuring them concurrently). They are
+            // READ-ONLY here. Only the interior may be reordered.
+            if (evaluate_local_entropy(arr) && n > 2) {
+                std::stable_sort(arr.begin() + 1, arr.end() - 1);
             }
+            // Always reclassify. After the interior sort this normally collapses
+            // to 2-3 runs, and the scan is over data still hot in L1.
             return generate_sequential_metadata(arr);
         }
 
@@ -129,12 +135,15 @@ namespace multimerge {
             size_t end = std::min(start + micro_slice_len, n);
             auto span = arr.subspan(start, end - start);
             
-            if (evaluate_local_entropy(span)) {
-                std::stable_sort(span.begin(), span.end());
-                local_meta[i] = { static_cast<int64_t>(span.size()) };
-            } else {
-                local_meta[i] = generate_sequential_metadata(span);
+            // OVERLAP CONTRACT: span[0] belongs to micro-block i-1 and
+            // span[size-1] belongs to micro-block i+1. Writing to them would
+            // invalidate metadata already emitted by the neighbour. Sorting only
+            // the interior keeps every write disjoint, so this stays stable and
+            // race-free.
+            if (evaluate_local_entropy(span) && span.size() > 2) {
+                std::stable_sort(span.begin() + 1, span.end() - 1);
             }
+            local_meta[i] = generate_sequential_metadata(span);
         }
 
         std::vector<int64_t> combined;
@@ -232,23 +241,53 @@ namespace multimerge {
         size_t total = a.size() + b.size();
         if (total <= leaf_size) { merge_seq(a, b, dest); return; }
 
-        size_t k = total / 2;
-        auto [split_a, split_b] = co_rank(k, a, b);
+#ifdef MULTIMERGE_BIDIR
+        // MERGE BIDIRECIONAL, com o limiar corrigido.
+        //
+        // O `if(k > 32768)` original era inalcancavel: parallel_merge so chama
+        // esta funcao com total <= leaf_size*16 = 65536, logo k <= 32768 e a
+        // comparacao e estrita. A task nunca era diferida - merge_front rodava
+        // ate o fim e so entao merge_back comecava. As duas threads nunca
+        // existiram. Amarrando o limiar a leaf_size, ela passa a disparar.
+        const size_t k = total / 2;
+        const bool spawn = (k > leaf_size);
 
-        auto a_front = a.subspan(0, split_a);
-        auto a_back  = a.subspan(split_a);
-        auto b_front = b.subspan(0, split_b);
-        auto b_back  = b.subspan(split_b);
-        auto dest_front = dest.subspan(0, k);
-        auto dest_back  = dest.subspan(k);
+        if constexpr (std::is_trivially_copyable_v<T>) {
+            // TEOREMA DO MERGE BIDIRECIONAL
+            // merge_front (empate -> A) emite os k menores, em ordem.
+            // merge_back  (empate -> B) emite os total-k maiores, em ordem.
+            // Os dois conjuntos particionam o multiconjunto para QUALQUER k,
+            // entao nenhum ponto de corte precisa ser calculado - cada lado so
+            // conta as proprias saidas. O co_rank aqui era trabalho redundante.
+            //
+            // Seguranca: os dois lados leem a e b INTEIROS. Para T trivialmente
+            // copiavel, std::move e copia e nunca muta a origem, entao as
+            // leituras sobrepostas no ponto de encontro sao leituras puras.
+            // As escritas caem em metades disjuntas de dest. Sem race.
+            #pragma omp task if(spawn)
+            merge_front(a, b, dest.subspan(0, k));
 
-        // Prevents task explosion by enforcing a size threshold
-        #pragma omp task if(k > 32768)
-        merge_front(a_front, b_front, dest_front);
-        
-        merge_back(a_back, b_back, dest_back);
-        
-        #pragma omp taskwait
+            merge_back(a, b, dest.subspan(k));
+
+            #pragma omp taskwait
+        } else {
+            // Tipos cujo move MUTA a origem: as leituras sobrepostas no ponto
+            // de encontro seriam race de verdade. Mantem o corte disjunto.
+            auto [split_a, split_b] = co_rank(k, a, b);
+
+            #pragma omp task if(spawn)
+            merge_front(a.subspan(0, split_a), b.subspan(0, split_b), dest.subspan(0, k));
+
+            merge_back(a.subspan(split_a), b.subspan(split_b), dest.subspan(k));
+
+            #pragma omp taskwait
+        }
+#else
+        // VARIANTE C (padrao): uma unica passada para frente.
+        // Sem co_rank redundante, sem overhead de task, e sem a caminhada
+        // reversa que atrapalha o prefetcher.
+        merge_seq(a, b, dest);
+#endif
     }
 
     const size_t CORANK_SPLIT_FACTOR = 16;
@@ -300,6 +339,344 @@ namespace multimerge {
             offsets.push_back(off);
         }
         return offsets;
+    }
+
+    // =====================================================================
+    //  K-WAY MERGE
+    //
+    //  Motivo: o merge binario paga log2(runs) passadas sobre a memoria e a
+    //  maquina esta saturada em banda. Um merge de K vias paga logK(runs).
+    //  Com K=8 e 30000 runs: 15 niveis viram 5.
+    //
+    //  Tres pecas:
+    //    1. WinnerTree      - merge sequencial de K vias, estavel
+    //    2. multiseq_partition - corte por rank em K sequencias (paralelismo)
+    //    3. bottom_up_merge_kway - recursao K-aria sobre o metadata
+    //
+    //  ESTABILIDADE: empates sempre vencem pelo MENOR indice de stream, tanto
+    //  na WinnerTree quanto na distribuicao de empates do multiseq_partition.
+    //  As duas regras precisam concordar, senao o corte paralelo e o merge
+    //  sequencial produzem ordens diferentes.
+    // =====================================================================
+
+    #ifndef KWAY_FANOUT
+#define KWAY_FANOUT 8
+#endif
+    constexpr int KWAY_K = KWAY_FANOUT;   // potencia de 2
+
+    template <typename T, int K>
+    struct WinnerTree {
+        T*  head[K];
+        T*  fin[K];
+        int node[2 * K];
+        int ns = 0;
+
+        // stream a vence stream b?
+        // INVARIANTE: em node[j] = beats(node[2j], node[2j+1]), o slot 2j vem
+        // sempre da subarvore ESQUERDA, logo indice(a) < indice(b) sempre.
+        // O desempate estavel e portanto sempre `<=`, sem branch de indice.
+        inline bool beats(int a, int b) const {
+            if (b < 0) return true;
+            if (a < 0) return false;
+            if (head[a] == fin[a]) return false;   // exaurido sempre perde
+            if (head[b] == fin[b]) return true;
+            return *head[a] <= *head[b];
+        }
+
+        void build() {
+            for (int i = 0; i < K; ++i) node[K + i] = (i < ns) ? i : -1;
+            for (int j = K - 1; j >= 1; --j)
+                node[j] = beats(node[2 * j], node[2 * j + 1]) ? node[2 * j] : node[2 * j + 1];
+        }
+
+        inline void update(int s) {
+            for (int j = (K + s) / 2; j >= 1; j /= 2)
+                node[j] = beats(node[2 * j], node[2 * j + 1]) ? node[2 * j] : node[2 * j + 1];
+        }
+
+        void merge_into(T* dest, size_t count) {
+            build();
+            for (size_t i = 0; i < count; ++i) {
+                const int w = node[1];
+                dest[i] = std::move(*head[w]);
+                ++head[w];
+                update(w);
+            }
+        }
+    };
+
+    // Acha out[i] com sum(out) == rank, tal que os prefixos sao exatamente os
+    // `rank` menores elementos. Empates distribuidos em ordem de stream.
+    template <typename T, int K>
+    void multiseq_partition(T* const* seq, const size_t* len, int ns,
+                            size_t rank, size_t* out) {
+        size_t lo[K], hi[K], plt[K], ple[K];
+        for (int i = 0; i < ns; ++i) { lo[i] = 0; hi[i] = len[i]; }
+
+        while (true) {
+            int m = -1; size_t w = 0;
+            for (int i = 0; i < ns; ++i)
+                if (hi[i] - lo[i] > w) { w = hi[i] - lo[i]; m = i; }
+            if (m < 0) { for (int i = 0; i < ns; ++i) out[i] = lo[i]; return; }
+
+            const T P = seq[m][lo[m] + (hi[m] - lo[m]) / 2];
+
+            size_t lt = 0, le = 0;
+            for (int i = 0; i < ns; ++i) {
+                plt[i] = (size_t)(std::lower_bound(seq[i], seq[i] + len[i], P) - seq[i]);
+                ple[i] = (size_t)(std::upper_bound(seq[i], seq[i] + len[i], P) - seq[i]);
+                lt += plt[i]; le += ple[i];
+            }
+
+            if (lt <= rank && rank <= le) {
+                size_t need = rank - lt;
+                for (int i = 0; i < ns; ++i) {
+                    const size_t ties = ple[i] - plt[i];
+                    const size_t take = (ties < need) ? ties : need;
+                    out[i] = plt[i] + take;
+                    need -= take;
+                }
+                return;
+            }
+            if (lt > rank) { for (int i = 0; i < ns; ++i) if (plt[i] < hi[i]) hi[i] = plt[i]; }
+            else           { for (int i = 0; i < ns; ++i) if (ple[i] > lo[i]) lo[i] = ple[i]; }
+        }
+    }
+
+
+    // TILE em ELEMENTOS. O otimo medido fica em L1 (512 em maquina com L1=32KB,
+    // 1024 em outra). Derivado do L1 em vez de fixo: 3 buffers ativos por tile
+    // (entrada streamada + s1 + s2), entao L1/(3*sizeof(T)) e o alvo.
+    template <typename T>
+    inline size_t tile_elems() {
+        const size_t L1 = 32768;
+        // /8 e nao /3. O calculo ingenuo ("3 buffers ativos: entrada, s1, s2")
+        // da 1365 para u64, mas o otimo medido e 512. A diferenca e que os
+        // dados de entrada streamados tambem disputam L1 com s1 e s2, entao o
+        // orcamento real por buffer e bem menor que um terco.
+        // Medido em duas maquinas independentes: 512 elementos para u64
+        // (490 Melem/s contra ~460 em 1365).
+        size_t t = L1 / (8 * std::max<size_t>(sizeof(T), 1));
+        return std::clamp<size_t>(t, 128, 2048);
+    }
+
+
+    // Scratch por thread, alocado uma unica vez. Alocar por chamada colocava
+    // malloc no caminho critico: com milhares de merges pequenos isso sozinho
+    // custava mais do que a blocagem economizava.
+    template <typename T>
+    T* tiled_scratch() {
+        static thread_local std::unique_ptr<T[]> buf;
+        static thread_local size_t cap = 0;
+        const size_t need = 2 * tile_elems<T>();
+        if (cap < need) { buf = std::make_unique_for_overwrite<T[]>(need); cap = need; }
+        return buf.get();
+    }
+
+    template <typename T>
+    void bottom_up_merge(std::span<T>, std::span<T>, std::span<const int64_t>,
+                         std::span<const size_t>, size_t, bool);
+
+    // Acima deste tamanho o merge estoura o cache e a blocagem paga. Abaixo,
+    // o merge ja e cache-resident e o caminho binario simples ganha, porque
+    // nao paga particionamento nem tiles.
+    constexpr size_t KWAY_MIN_BYTES = 2u << 20;   // 2 MB
+
+    // Merge de ns <= K runs com BLOCAGEM DE CACHE.
+    //
+    // Em vez de log2(K) passadas na DRAM, corta a saida em tiles que cabem em
+    // L1 via multiseq_partition e roda a arvore binaria de log2(K) niveis
+    // inteiramente dentro do cache. A DRAM ve 1 leitura + 1 escrita.
+    //
+    // O kernel continua sendo o merge_seq com indices diretos - e por isso que
+    // isso ganha da winner tree, que paga indirecao por elemento.
+    template <typename T, int K>
+    void kway_merge_tiled(T* const* runs, const size_t* lens, int ns,
+                          T* dest, size_t total) {
+        if (ns == 1) { std::move(runs[0], runs[0] + lens[0], dest); return; }
+        if (ns == 2) {
+            merge_seq<T>(std::span<T>(runs[0], lens[0]), std::span<T>(runs[1], lens[1]),
+                         std::span<T>(dest, total));
+            return;
+        }
+
+        const size_t TILE = tile_elems<T>();
+        T* s1 = tiled_scratch<T>();      // thread_local, alocado UMA vez
+        T* s2 = s1 + TILE;
+
+        size_t cur[K] = {0};
+        // Inicializados: o GCC nao prova que o laco `for (i < ns)` abaixo os
+        // preenche antes do uso apos inlinar. Falso positivo, mas warning que
+        // fica escondendo os de verdade. As escritas mortas somem no -O3.
+        T*     win[K]  = {};
+        size_t wlen[K] = {}, cut[K] = {}, seglen[K] = {};
+        size_t done = 0;
+
+        while (done < total) {
+            const size_t want = std::min(TILE, total - done);
+
+            // Janela restrita: um tile consome no maximo `want` de qualquer run,
+            // entao a busca binaria roda sobre `want`, nao sobre o run inteiro.
+            for (int i = 0; i < ns; ++i) {
+                win[i]  = runs[i] + cur[i];
+                wlen[i] = std::min(lens[i] - cur[i], want);
+            }
+            multiseq_partition<T, K>(win, wlen, ns, want, cut);
+
+            // arvore binaria sobre os ns segmentos, toda em s1/s2 (L1)
+            int    cnt = ns;
+            T*     srcp[K] = {};
+            size_t srcl[K] = {};
+            for (int i = 0; i < ns; ++i) { srcp[i] = win[i]; srcl[i] = cut[i]; }
+
+            T* buf = s1;
+            T* alt = s2;
+            while (cnt > 2) {
+                int  out = 0;
+                size_t off = 0;
+                for (int i = 0; i < cnt; i += 2) {
+                    if (i + 1 == cnt) {                       // sobra impar: so copia
+                        std::move(srcp[i], srcp[i] + srcl[i], buf + off);
+                        seglen[out] = srcl[i];
+                    } else {
+                        merge_seq<T>(std::span<T>(srcp[i], srcl[i]),
+                                     std::span<T>(srcp[i + 1], srcl[i + 1]),
+                                     std::span<T>(buf + off, srcl[i] + srcl[i + 1]));
+                        seglen[out] = srcl[i] + srcl[i + 1];
+                    }
+                    srcp[out] = buf + off;
+                    off += seglen[out];
+                    ++out;
+                }
+                for (int i = 0; i < out; ++i) srcl[i] = seglen[i];
+                cnt = out;
+                std::swap(buf, alt);
+            }
+            // ultimo nivel escreve DIRETO no destino: a unica escrita na DRAM
+            if (cnt == 2)
+                merge_seq<T>(std::span<T>(srcp[0], srcl[0]), std::span<T>(srcp[1], srcl[1]),
+                             std::span<T>(dest + done, want));
+            else
+                std::move(srcp[0], srcp[0] + srcl[0], dest + done);
+
+            for (int i = 0; i < ns; ++i) cur[i] += cut[i];
+            done += want;
+        }
+    }
+
+    template <typename T, int K>
+    void parallel_kway_merge(T* const* heads, const size_t* lens, int ns,
+                             T* dest, size_t total, size_t leaf_size) {
+        if (ns == 1) { std::move(heads[0], heads[0] + lens[0], dest); return; }
+
+        if (total <= leaf_size * CORANK_SPLIT_FACTOR) {
+            kway_merge_tiled<T, K>(heads, lens, ns, dest, total);
+            return;
+        }
+
+        size_t cut[K] = {};
+        multiseq_partition<T, K>(heads, lens, ns, total / 2, cut);
+
+        T*     lh[K] = {}; size_t ll[K] = {};
+        T*     rh[K] = {}; size_t rl[K] = {};
+        size_t ltot = 0;
+        for (int i = 0; i < ns; ++i) {
+            lh[i] = heads[i];           ll[i] = cut[i];              ltot += cut[i];
+            rh[i] = heads[i] + cut[i];  rl[i] = lens[i] - cut[i];
+        }
+
+        #pragma omp task firstprivate(lh, ll, ns, dest, ltot, leaf_size)
+        parallel_kway_merge<T, K>(lh, ll, ns, dest, ltot, leaf_size);
+
+        parallel_kway_merge<T, K>(rh, rl, ns, dest + ltot, total - ltot, leaf_size);
+
+        #pragma omp taskwait
+    }
+
+    template <typename T>
+    void bottom_up_merge_kway(std::span<T> v, std::span<T> buf,
+                              std::span<const int64_t> metadata,
+                              std::span<const size_t> offsets,
+                              size_t leaf_size, bool into_buf) {
+        constexpr int K = KWAY_K;
+        const size_t num_blocks = metadata.size();
+
+        if (num_blocks == 1) {
+            const bool is_desc = metadata[0] < 0;
+            if (into_buf) {
+                if (is_desc) std::reverse(v.begin(), v.end());
+                std::move(v.begin(), v.end(), buf.begin());
+            } else if (is_desc) {
+                std::reverse(v.begin(), v.end());
+            }
+            return;
+        }
+
+        const size_t base  = offsets[0];
+        const size_t total = offsets[num_blocks] - base;
+
+        // HIBRIDO: k-vias so nos niveis de topo, que sao os que vao a DRAM.
+        // Abaixo do limiar todo o subtrecho cabe em cache e o binario e mais
+        // rapido. Aplicar blocagem onde nao ha cache miss so custa.
+        if (total * sizeof(T) <= KWAY_MIN_BYTES) {
+            bottom_up_merge<T>(v, buf, metadata, offsets, leaf_size, into_buf);
+            return;
+        }
+
+        const int    g     = (int)std::min<size_t>(K, num_blocks);
+
+        // Cortes BALANCEADOS POR ELEMENTO, nao por contagem de runs.
+        // (o binario usa num_blocks/2, que desequilibra quando os runs tem
+        //  tamanhos muito diferentes)
+        size_t cm[K + 1];
+        cm[0] = 0; cm[g] = num_blocks;
+        for (int i = 1; i < g; ++i) {
+            const size_t target = base + total * (size_t)i / (size_t)g;
+            size_t idx = (size_t)(std::lower_bound(offsets.begin(), offsets.end(), target)
+                                  - offsets.begin());
+            if (idx < cm[i - 1] + 1) idx = cm[i - 1] + 1;
+            if (idx > num_blocks - (size_t)(g - i)) idx = num_blocks - (size_t)(g - i);
+            cm[i] = idx;
+        }
+
+        for (int i = 0; i < g; ++i) {
+            const size_t lo = cm[i], hi = cm[i + 1];
+            const size_t s = offsets[lo] - base, e = offsets[hi] - base;
+            auto sub_v = v.subspan(s, e - s);
+            auto sub_b = buf.subspan(s, e - s);
+            auto sub_m = metadata.subspan(lo, hi - lo);
+            auto sub_o = offsets.subspan(lo, hi - lo + 1);
+            if (i < g - 1) {
+                #pragma omp task firstprivate(sub_v, sub_b, sub_m, sub_o, leaf_size, into_buf)
+                bottom_up_merge_kway<T>(sub_v, sub_b, sub_m, sub_o, leaf_size, !into_buf);
+            } else {
+                bottom_up_merge_kway<T>(sub_v, sub_b, sub_m, sub_o, leaf_size, !into_buf);
+            }
+        }
+        #pragma omp taskwait
+
+        // Origem = o buffer onde os filhos escreveram
+        std::span<T> src  = into_buf ? v : buf;
+        std::span<T> dst  = into_buf ? buf : v;
+
+        // ATALHO PRESERVADO: grupos adjacentes ja em ordem viram UM stream so.
+        // Se todos colarem, ns==1 e o merge inteiro vira um move.
+        T*     heads[K] = {};
+        size_t lens[K] = {};
+        int    ns = 0;
+        size_t gs = 0;
+        for (int i = 0; i < g; ++i) {
+            const size_t e = offsets[cm[i + 1]] - base;
+            const bool join_next = (i + 1 < g) && (src[e - 1] <= src[e]);
+            if (!join_next) {
+                heads[ns] = src.data() + gs;
+                lens[ns]  = e - gs;
+                ++ns; gs = e;
+            }
+        }
+
+        if (ns == 1) { std::move(src.begin(), src.end(), dst.begin()); return; }
+        parallel_kway_merge<T, K>(heads, lens, ns, dst.data(), total, leaf_size);
     }
 
     template <typename T>
@@ -438,7 +815,11 @@ namespace multimerge {
         {
             #pragma omp single
             {
+#ifdef MULTIMERGE_KWAY
+                bottom_up_merge_kway<T>(arr, buffer, metadata, offsets, leaf_size, false);
+#else
                 bottom_up_merge<T>(arr, buffer, metadata, offsets, leaf_size, false);
+#endif
             }
         }
     }
