@@ -9,6 +9,7 @@ fn main() {
     // previous object file and you would benchmark the wrong binary.
     println!("cargo:rerun-if-env-changed=MULTIMERGE_KWAY");
     println!("cargo:rerun-if-env-changed=MULTIMERGE_BIDIR");
+    println!("cargo:rerun-if-env-changed=MULTIMERGE_GNU");
     println!("cargo:rerun-if-env-changed=MULTIMERGE_NATIVE");
 
     let mut build = cc::Build::new();
@@ -36,17 +37,22 @@ fn main() {
         .flag("-O3")
         .flag("-fopenmp");
 
-    // Fallback engine for high-entropy data.
-    build.define("MULTIMERGE_USE_GNU_PARALLEL", None);
+    // Fallback engine for high-entropy data. ON by default uses
+    // __gnu_parallel::stable_sort; set MULTIMERGE_GNU=0 to use the internal
+    // chunk_parallel_sort instead.
+    let gnu = std::env::var("MULTIMERGE_GNU")
+        .map(|v| !v.is_empty() && v != "0").unwrap_or(true);
+    if gnu { build.define("MULTIMERGE_USE_GNU_PARALLEL", None); }
 
-    // Cache-blocked k-way merge. OFF by default: it only pays above the 2 MB
-    // threshold in the header, and the win has not been confirmed on every
-    // machine yet. Enable with:
-    //     $env:MULTIMERGE_KWAY = "1"   (PowerShell)
-    //     MULTIMERGE_KWAY=1            (bash)
+    // Cache-blocked k-way merge. ON by default.
+    // Disable for A/B benchmarking with:
+    //     $env:MULTIMERGE_KWAY = "0"   (PowerShell)
+    //     MULTIMERGE_KWAY=0            (bash)
     // Optional fan-out override, must be a power of two (default 8):
     //     $env:MULTIMERGE_KWAY = "16"
-    let kway = std::env::var("MULTIMERGE_KWAY").unwrap_or_default();
+    // Default: ON. Set MULTIMERGE_KWAY=0 to fall back to the plain binary
+    // merge tree (useful for A/B benchmarking).
+    let kway = std::env::var("MULTIMERGE_KWAY").unwrap_or_else(|_| "1".to_string());
     let kway_on = !kway.is_empty() && kway != "0";
     if kway_on {
         build.define("MULTIMERGE_KWAY", None);
@@ -58,12 +64,12 @@ fn main() {
     }
 
     // Bidirectional leaf merge (merge_front + merge_back running as two tasks).
-    // OFF by default. The original `if(k > 32768)` was unreachable, so the two
-    // halves always ran sequentially; this rebuilds it with the threshold tied
-    // to leaf_size so the task actually spawns.
-    //     $env:MULTIMERGE_BIDIR = "1"
+    // ON by default - this is the core mechanic of the project. The original
+    // `if(k > 32768)` was unreachable, so the two halves always ran
+    // sequentially; the threshold is now tied to leaf_size so the task really
+    // spawns. Disable for A/B benchmarking with MULTIMERGE_BIDIR=0.
     let bidir = std::env::var("MULTIMERGE_BIDIR")
-        .map(|v| !v.is_empty() && v != "0").unwrap_or(false);
+        .map(|v| !v.is_empty() && v != "0").unwrap_or(true);
     if bidir { build.define("MULTIMERGE_BIDIR", None); }
 
     // -march=native is opt-in because it makes the binary non-portable.
@@ -78,7 +84,7 @@ fn main() {
     // run against a different build than intended; this line makes the mode
     // visible in normal cargo output.
     println!(
-        "cargo:warning=multimerge C++ engine: kway={} fanout={} bidir={} native={}",
+        "cargo:warning=multimerge C++ engine: kway={} fanout={} bidir={} gnu_parallel={} native={}",
         if kway_on { "ON" } else { "off" },
         if kway_on && kway.parse::<u32>().map(|k| k > 1).unwrap_or(false) {
             kway.clone()
@@ -88,6 +94,7 @@ fn main() {
             "-".to_string()
         },
         if bidir { "ON" } else { "off" },
+        if gnu { "ON" } else { "off (chunk_parallel_sort)" },
         if native { "ON" } else { "off" }
     );
 

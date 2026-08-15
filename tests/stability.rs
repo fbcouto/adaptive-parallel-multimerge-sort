@@ -1,4 +1,4 @@
-use rustport::multimerge::multi_merge_sort;
+use adaptive_parallel_multimerge_sort::sort as multi_merge_sort;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Keyed { key: u64, idx: u64 }

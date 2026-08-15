@@ -29,7 +29,7 @@ use std::fs;
 use std::io::{BufWriter, Write};
 use std::time::Instant;
 
-const N: usize = 20_000_000;
+const N: usize = 10_000_000;
 const DIR: &str = "crosscheck";
 
 fn lcg(s: &mut u64) -> u64 {

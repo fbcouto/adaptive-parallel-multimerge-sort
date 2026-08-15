@@ -79,30 +79,81 @@ The engine is **stable end to end**, and every phase is built to keep it that wa
 
 
 
-## 📊 Benchmark Highlights
+## 📊 Benchmarks
 
-Tested on modern multi-core hardware against Rust's native `rayon` library, pushing up to **2.4 Gigabytes of raw `u64` keys (300 Million elements)**.
+Rust engine against `rayon::par_sort` (stable), `u64` keys, Criterion with 20
+samples per point. Ratios are Rayon time divided by MultiMerge time, so higher
+is better.
 
-### Scenario A: 100 Million Elements
-| Scenario | Rayon (Baseline) | C++ MultiMerge | Rust MultiMerge (Copy) | Winner |
-| :--- | :--- | :--- | :--- | :--- |
-| **Fully Sorted** | 87.20 ms | **86.11 ms** | 87.37 ms | **Tie (Hardware Bound ~1.16 Gelem/s)** |
-| **Reversed** | 161.15 ms | 159.50 ms | **159.09 ms** | **Rust MultiMerge (Copy)** |
-| **Sawtooth (Database-like)** | **1.02 s** | 1.07 s | 1.05 s | **Rayon (~3% lead)** |
-| **Random Chaos** | 2.09 s | 2.76 s | **1.99 s** | **Rust MultiMerge (Copy)** |
-| **Low Cardinality** | **1.95 s** | 2.57 s | 1.96 s | **Tie (Rayon / Rust)** |
+| Scenario | 1M | 5M | 10M | 30M |
+| :--- | ---: | ---: | ---: | ---: |
+| **Sawtooth** (1000-element teeth) | 0.96× | **1.50×** | **1.45×** | **1.32×** |
+| Fully sorted | 1.02× | 1.01× | 1.01× | 1.00× |
+| Reversed | 1.09× | 0.94× | 0.99× | 0.96× |
+| Random | 0.99× | 1.02× | 1.00× | 1.00× |
+| Low cardinality | 1.01× | 1.04× | 0.96× | 1.00× |
 
-### Scenario B: 300 Million Elements (Extreme Scale)
-| Scenario | Rayon (Baseline) | C++ MultiMerge | Rust MultiMerge (Copy) | Winner |
-| :--- | :--- | :--- | :--- | :--- |
-| **Fully Sorted** | 261.53 ms | **257.09 ms** | 257.44 ms | **C++ / Rust (Hardware Bound)** |
-| **Reversed** | **446.24 ms** | 450.33 ms | 461.44 ms | **Rayon (~1% lead)** |
-| **Sawtooth (Database-like)** | **2.98 s** | 3.14 s | 3.10 s | **Rayon (~3% lead)** |
-| **Random Chaos** | **6.42 s** | 9.22 s | 6.50 s | **Rayon / Rust Tie** |
-| **Low Cardinality** | **6.36 s** | 8.89 s | 7.02 s | **Rayon** |
+Absolute throughput at 30M elements:
 
-> *Note: Both C++ and Rust implementations achieve processing speeds of over **1 Billion elements per second** in highly structured datasets (Sorted), maxing out the physical memory bandwidth. In chaotic and massive datasets, the $O(1)$ Entropy Shield ensures safe bailout to standard parallel fallback engines, maintaining state-of-the-art times safely close to Rayon.*
+| Scenario | Rayon | MultiMerge |
+| :--- | ---: | ---: |
+| Fully sorted | 1.114 Gelem/s | 1.114 Gelem/s |
+| Reversed | 638.8 Melem/s | 614.8 Melem/s |
+| Sawtooth | 102.6 Melem/s | **135.5 Melem/s** |
+| Low cardinality | 54.0 Melem/s | 53.9 Melem/s |
+| Random | 52.4 Melem/s | 52.3 Melem/s |
 
+### What the numbers say
+
+**The advantage is structural, and it needs scale.** The engine wins where the
+data contains many overlapping sorted runs — the sawtooth case — and the win
+appears only above roughly two to three million elements. Below that, the
+cache-blocked k-way merge engages for at most one level before the sub-ranges
+drop under its 2 MB threshold, and it does not get the chance to pay for
+itself. This is a property of the design, not a tuning accident: the k-way path
+exists to cut passes over DRAM, and small arrays never leave cache.
+
+**Where there is no structure to exploit, it matches the baseline.** Across the
+four non-sawtooth scenarios the largest deviation in either direction is 4%,
+and at the extremes of the size range it is under 1%. That symmetry matters
+more than the peak number: an adaptive sort that sometimes loses badly is not
+usable as a general replacement. The entropy shield exists precisely to make
+this true — when the sample says the data is noise, the engine steps aside.
+
+**Random is the same code.** On chaotic input the Rust engine delegates to
+`rayon::par_sort`, so the 1.00× row is an identity, not a contest. It is
+reported here because it is the control: if those numbers had diverged, the
+measurement itself would be suspect.
+
+**The 1 Gelem/s figure is real but shared.** Both engines reach 1.114 Gelem/s
+on fully sorted data at 30M, which is the memory bandwidth ceiling of the test
+machine rather than an algorithmic result. Detection is a single linear pass;
+there is nothing left to optimize once the array is read once.
+
+### Caveats
+
+Sawtooth at 30M and low cardinality at 10M were the noisiest points, with 12%
+and 16% spread between the confidence bounds and several severe outliers. Treat
+those two ratios as approximate.
+
+The sawtooth pattern (`i % 1000`) is worth naming honestly: every run ends at
+its maximum and the next begins at its minimum, so adjacent runs overlap
+completely in range. Measured by comparison count, it is the *worst* case for an
+adaptive merge, not a typical one — the shortcut that turns an already-ordered
+merge into a copy never fires. Real database workloads, where sorted segments
+tend to overlap only partially, land between this and the fully sorted case.
+
+### Correctness
+
+Every release is checked by three independent layers:
+
+- 16 unit and integration tests, including stability under duplicate keys,
+  descending runs with plateaus, and a 150-case structured/chaotic fuzz
+- A cross-check binary that sorts identical inputs with all three engines
+  (Rayon, MultiMerge Rust, MultiMerge C++) across six data patterns and compares
+  every output against `slice::sort` as an independent reference
+- A C++ kernel test that validates the bidirectional merge theorem over 4000
+  cases with a key domain of 1 to 6 distinct values, saturating tie-breaking
 
 ## ⚙️ Getting Started
 

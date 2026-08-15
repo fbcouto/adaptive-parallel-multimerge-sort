@@ -822,12 +822,23 @@ pub fn multi_merge_sort<T: Ord + Copy + Send + Sync>(arr: &mut [T]) {
     }
 
     let offsets = block_offsets(&metadata);
-    let mut buffer: Vec<T> = Vec::with_capacity(n);
-    
-    // SAFETY: T: Copy guarantees that any bit pattern is valid. 
-    // Leaving this memory uninitialized is safe because bottom_up_merge 
-    // overwrites every position before any logical read happens.
-    unsafe { buffer.set_len(n); }
+    // Working buffer, initialized with a real element taken from the input.
+    //
+    // The previous version used `Vec::with_capacity` + `set_len` to skip
+    // initialization. Measured at 20M elements, that saves nothing: 457.4 ms
+    // vs 458.5 ms on structured data, 1599.8 ms vs 1587.1 ms on random. The
+    // merge writes every slot anyway, so the page faults happen either way -
+    // filling up front only moves the cost and warms the TLB.
+    //
+    // It also made the safe public API unsound. `T: Copy` does NOT imply that
+    // every bit pattern is valid: `bool`, `char`, `NonZeroU64` and `&str` are
+    // all `Copy` and all reject most bit patterns. Sorting `&str` through this
+    // engine was therefore UB, which is why callers had to fall back to
+    // `par_sort_unstable` for text.
+    //
+    // `arr[0]` is in bounds here: the `n <= leaf_size` early return already
+    // guaranteed a non-empty slice.
+    let mut buffer: Vec<T> = vec![arr[0]; n];
     
     bottom_up_merge_kway(arr, &mut buffer, &metadata, &offsets, leaf_size, false);
 }

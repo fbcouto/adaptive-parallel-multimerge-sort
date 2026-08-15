@@ -61,18 +61,19 @@ fn generate_low_cardinality(size: usize) -> Vec<u64> {
 
 fn bench_final_arena(c: &mut Criterion) {
     let sizes = [
-     // 1_000_000,  //, 
-       100_000_000 //,
-      //10_000_000,
-      //50_000_000, 100_000_000
+       1_000_000,  //, 
+       5_000_000 ,
+       10_000_000,
+      30_000_000
+      //, 100_000_000
     ];
 
     let scenarios = [
-      //  ("Scenario_Sorted", generate_sorted as fn(usize) -> Vec<u64>),
-      //  ("Scenario_Reversed", generate_reversed as fn(usize) -> Vec<u64>),
+        ("Scenario_Sorted", generate_sorted as fn(usize) -> Vec<u64>),
+        ("Scenario_Reversed", generate_reversed as fn(usize) -> Vec<u64>),
         ("Scenario_Random", generate_random as fn(usize) -> Vec<u64>),
-      //  ("Scenario_Sawtooth_1000", generate_sawtooth as fn(usize) -> Vec<u64>),
-       // ("Scenario_LowCardinality", generate_low_cardinality as fn(usize) -> Vec<u64>),
+        ("Scenario_Sawtooth_1000", generate_sawtooth as fn(usize) -> Vec<u64>),
+        ("Scenario_LowCardinality", generate_low_cardinality as fn(usize) -> Vec<u64>),
     ];
 
     for (scenario_name, generator) in scenarios.iter() {
@@ -111,7 +112,7 @@ fn bench_final_arena(c: &mut Criterion) {
                     BatchSize::LargeInput,
                 )
             });
-
+       /*
             // 3. Sua engine Híbrida C++ (OpenMP + L1 Cache)
             group.bench_with_input(BenchmarkId::new("3_MultiMerge_Stable_Cpp", size), &size, |b, _| {
                 b.iter_batched(
@@ -120,7 +121,7 @@ fn bench_final_arena(c: &mut Criterion) {
                     BatchSize::LargeInput,
                 )
             });
-
+       */
 
         }
         group.finish();
