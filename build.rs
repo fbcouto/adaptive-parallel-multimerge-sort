@@ -10,6 +10,10 @@ fn main() {
     println!("cargo:rerun-if-env-changed=MULTIMERGE_KWAY");
     println!("cargo:rerun-if-env-changed=MULTIMERGE_BIDIR");
     println!("cargo:rerun-if-env-changed=MULTIMERGE_GNU");
+    println!("cargo:rerun-if-env-changed=MULTIMERGE_TBB");
+    println!("cargo:rerun-if-env-changed=MULTIMERGE_TBB_SCHED");
+    println!("cargo:rerun-if-env-changed=MULTIMERGE_TBB_REDUCE");
+    println!("cargo:rerun-if-env-changed=MULTIMERGE_TBB_MALLOC");
     println!("cargo:rerun-if-env-changed=MULTIMERGE_PSTL");
     println!("cargo:rerun-if-env-changed=MULTIMERGE_TBB_LIB");
     println!("cargo:rerun-if-env-changed=MULTIMERGE_NATIVE");
@@ -72,6 +76,33 @@ fn main() {
     }
     if gnu && !pstl { build.define("MULTIMERGE_USE_GNU_PARALLEL", None); }
 
+    // Optional TBB layer. The engine does not depend on TBB: where it is
+    // present some points can use it, where it is absent the original OpenMP
+    // path stands unchanged. Each point is a separate switch so it can be
+    // measured on its own -- that is how we found the chaotic fallback choice
+    // mattered more than the engine's own algorithm.
+    //
+    //   MULTIMERGE_TBB=1          enable the layer
+    //   MULTIMERGE_TBB_SCHED=1    merge tree via tbb::parallel_invoke
+    //   MULTIMERGE_TBB_REDUCE=1   metadata fold via tbb::parallel_reduce
+    //   MULTIMERGE_TBB_MALLOC=1   link tbbmalloc_proxy: replaces global
+    //                             malloc/free with TBB's scalable allocator.
+    //                             Needs no code change, and matters because the
+    //                             leaf std::stable_sort calls allocate PER CALL.
+    let flag = |n: &str| std::env::var(n).map(|v| !v.is_empty() && v != "0").unwrap_or(false);
+    let tbb = flag("MULTIMERGE_TBB") || flag("MULTIMERGE_TBB_SCHED")
+        || flag("MULTIMERGE_TBB_REDUCE");
+    let tbb_lib = std::env::var("MULTIMERGE_TBB_LIB").unwrap_or_else(|_| "tbb12".to_string());
+    if tbb {
+        build.define("MULTIMERGE_TBB", None);
+        if flag("MULTIMERGE_TBB_SCHED")  { build.define("MULTIMERGE_TBB_SCHED", None); }
+        if flag("MULTIMERGE_TBB_REDUCE") { build.define("MULTIMERGE_TBB_REDUCE", None); }
+        if !pstl { println!("cargo:rustc-link-lib={tbb_lib}"); }
+    }
+    if flag("MULTIMERGE_TBB_MALLOC") {
+        println!("cargo:rustc-link-lib=tbbmalloc_proxy");
+    }
+
     // Cache-blocked k-way merge. ON by default.
     // Disable for A/B benchmarking with:
     //     $env:MULTIMERGE_KWAY = "0"   (PowerShell)
@@ -112,7 +143,7 @@ fn main() {
     // run against a different build than intended; this line makes the mode
     // visible in normal cargo output.
     println!(
-        "cargo:warning=multimerge C++ engine: kway={} fanout={} bidir={} fallback={} native={}",
+        "cargo:warning=multimerge C++ engine: kway={} fanout={} bidir={} fallback={} native={} tbb={}",
         if kway_on { "ON" } else { "off" },
         if kway_on && kway.parse::<u32>().map(|k| k > 1).unwrap_or(false) {
             kway.clone()
@@ -125,7 +156,14 @@ fn main() {
         if pstl { "std::execution::par (PSTL+TBB)" }
         else if gnu { "__gnu_parallel" }
         else { "chunk_parallel_sort (interno)" },
-        if native { "ON" } else { "off" }
+        if native { "ON" } else { "off" },
+        {
+            let mut p: Vec<&str> = Vec::new();
+            if flag("MULTIMERGE_TBB_SCHED")  { p.push("sched"); }
+            if flag("MULTIMERGE_TBB_REDUCE") { p.push("reduce"); }
+            if flag("MULTIMERGE_TBB_MALLOC") { p.push("malloc"); }
+            if p.is_empty() { "off".to_string() } else { p.join("+") }
+        }
     );
 
     build

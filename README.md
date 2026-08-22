@@ -4,7 +4,7 @@ A high-performance, L1-cache optimized, hybrid stable parallel sorting algorithm
 
 The algorithm is built on a single observation: real database keys are almost never random. They arrive as long monotone stretches — an index being rebuilt, sorted segments being consolidated, a table appended in insertion order. A general-purpose sort throws that structure away and pays `n log n` regardless. This engine detects the structure first, in one linear pass, and only sorts what actually needs sorting.
 
-Against `std::stable_sort(std::execution::par, ...)` — the parallel stable sort of the C++17 standard library — it ties on every scenario measured and is **3.5x to 12x faster when the data already carries global order**: a rebuilt index, a table in insertion order, a segment merged by a previous operation. On already-sorted input it exceeds **1.5 Gelem/s**, which is the cost of reading the array once and discovering there is nothing to do.
+Against `std::stable_sort(std::execution::par, ...)` — the parallel stable sort of the C++17 standard library — it is **12x faster on reversed data, 2.9x on sorted data and 1.27x on almost-sorted data**, and costs at most 8% where there is no structure at all. Those first three are the shape of a rebuilt index, a table in insertion order, a segment merged by a previous operation: the common case in a database, and the one a general-purpose sort pays full price for.
 
 # 📚 Academic Background & Prior Work
 
@@ -85,61 +85,64 @@ The engine is **stable end to end**, and every phase is built to keep it that wa
 
 ## 📊 Benchmarks
 
-C++ engine, `{key, index}` pairs of 16 bytes, 5M elements, 8 threads. Median of
-9 runs with rotating order between engines and a control row that measures one
-engine twice to expose the noise floor. Every output is checked element by
-element against `std::stable_sort`, including the original index, so a wrong
-answer cannot be mistaken for a fast one.
+C++ engine, `{key, index}` pairs of 16 bytes, 15M elements, 8 threads. Median of
+9 runs with rotating order between engines, a discarded warm-up pass, and a
+control row that measures one engine twice to expose the noise floor. Every
+output is checked element by element against `std::stable_sort`, index included,
+so a wrong answer cannot be mistaken for a fast one.
 
 The reference is **`std::stable_sort(std::execution::par, ...)`** — the parallel
 stable sort of the C++17 standard library, backed by Intel TBB. It is the
-strongest baseline available, and the honest one: comparing an 8-thread engine
-against the single-threaded `std::stable_sort` measures parallelism, not
-algorithm.
+strongest baseline available. Comparing an 8-thread engine against the
+single-threaded `std::stable_sort` would measure parallelism, not algorithm.
 
-| Scenario | `std::stable_sort` | C++17 `par` | MultiMerge | vs `par` |
-| :--- | ---: | ---: | ---: | ---: |
-| **Already sorted** | 291.9 ms | 11.4 ms | **3.3 ms** | **−71%** |
-| **Reversed** | 299.6 ms | 122.4 ms | **10.4 ms** | **−92%** |
-| Almost sorted (0.1% noise) | 291.7 ms | 148.0 ms | 138.1 ms | −6.7% |
-| Sawtooth (`i % 1000`) | 276.1 ms | 127.9 ms | 130.6 ms | +2.1% |
-| Random, high cardinality | 675.4 ms | 169.3 ms | 160.5 ms | −5.2% |
-| Random, 64 distinct keys | 417.9 ms | 132.0 ms | 136.3 ms | +3.3% |
-| Random, 10 distinct keys | 385.3 ms | 128.7 ms | 132.3 ms | +2.8% |
-
-Noise floor per scenario: 1.0% to 4.0%.
+| Scenario | `stable_sort` | C++17 `par` | MultiMerge | vs `par` | noise |
+| :--- | ---: | ---: | ---: | ---: | ---: |
+| **Reversed** | 990.8 ms | 455.7 ms | **37.5 ms** | **12.2x** | 2.5% |
+| **Already sorted** | 897.2 ms | 33.0 ms | **11.5 ms** | **2.9x** | 0.9% |
+| **Almost sorted** (0.1% noise) | 942.4 ms | 549.9 ms | **432.5 ms** | **1.27x** | 1.3% |
+| Sawtooth (`i % 1000`) | 958.4 ms | 483.3 ms | 474.6 ms | 1.02x | 2.8% |
+| Random, high cardinality | 1932.6 ms | 537.9 ms | 503.8 ms | 1.07x | 1.4% |
+| Random, 64 distinct keys | 1313.9 ms | 497.3 ms | 517.9 ms | 0.96x | 0.6% |
+| Random, 10 distinct keys | 1193.5 ms | 454.3 ms | 493.0 ms | 0.92x | 3.4% |
 
 ### What the numbers say
 
-**Global order is where the engine is untouchable.** Already-sorted data
-finishes in 3.3 ms against 11.4 for the standard parallel sort — 3.5x — and
-reversed data in 10.4 against 122.4, nearly 12x. Neither is a faster sort: the
-detection pass finds a single run and the engine returns without sorting at all,
-or reverses once in parallel. No comparison sort can match that, because it must
-at minimum compare.
+**Global order is where the engine is untouchable.** Reversed data finishes in
+37.5 ms against 455.7 for the standard parallel sort, and already-sorted data in
+11.5 against 33.0. Neither is a faster sort: the detection pass finds a single
+run and the engine returns without sorting at all, or reverses once in parallel.
+No comparison sort can match that, because it must at minimum compare.
 
 This is not a synthetic corner. It is the shape of a rebuilt index, a table read
 in insertion order, a segment already merged by a previous operation — the
 common case in a database, and the one a general-purpose sort pays full price
 for.
 
-**Everywhere else it ties.** The five remaining scenarios land between −6.7% and
-+3.3%, and every one of those differences sits at or below the noise floor of
-its own row. That symmetry is the point: an adaptive sort that sometimes loses
-badly cannot replace a general one. The entropy shield exists to make this true
-— when the sample says the data is noise, the engine steps aside and delegates.
+**Partial order pays too, and it needs scale.** Almost-sorted data is 21% faster
+than the baseline at 15M. At 5M the same scenario was a tie: the k-way merge
+engages for too few levels before the sub-ranges drop under cache, and it does
+not get the chance to pay for itself. This is a property of the design, not a
+tuning accident — the k-way path exists to cut passes over DRAM, and small
+arrays never leave cache.
 
-**Being honest about sawtooth and almost-sorted.** Against
-`__gnu_parallel::stable_sort` these two scenarios showed the engine 43–47%
-ahead. Against the C++17 `par` they are a tie. The earlier margin was largely a
-margin over a weaker implementation, not a structural advantage. Reporting only
-the favourable baseline would have overstated the case by a factor of ten.
+**Chaotic input costs 4 to 8%, and that is the price of asking.** On the two
+low-cardinality random scenarios the engine is measurably *behind* the baseline
+it delegates to, by more than the noise floor. That gap is the entropy shield
+itself: sampling the array, deciding there is no structure, and handing the work
+over. It is the honest cost of adaptivity, and it is small enough that the engine
+remains a safe general replacement — which is the property that matters most. An
+adaptive sort that sometimes loses badly is not usable; one that loses 8% in its
+worst case is.
 
-**The fallback choice mattered more than the algorithm.** On random input the
-engine was losing 62–88% to the C++17 `par` — not because its own code was slow,
-but because the entropy shield delegated to `__gnu_parallel`, which is 29–48%
-slower than the PSTL implementation on every chaotic scenario measured. Pointing
-the shield at the better fallback closed the entire gap.
+**The fallback choice mattered more than the algorithm.** Before this was
+measured the engine delegated to `__gnu_parallel::stable_sort`, and lost 62–88%
+to the C++17 `par` on random input — not because its own code was slow, but
+because of where it handed off. `__gnu_parallel` uses a loser tree for its
+multiway merge, and a loser tree indexes its stream heads with a runtime value,
+which stops the compiler from keeping them in registers. This engine measured
+that cost directly and rejected the loser tree for the same reason (see the k-way
+section). Pointing the shield at the PSTL closed the entire gap.
 
 ### Caveats
 
@@ -153,11 +156,11 @@ so adjacent runs overlap completely in range and the shortcut that turns an
 already-ordered merge into a copy never fires. Real workloads, where sorted
 segments overlap only partially, land between this and the fully sorted case.
 
-**The `par` baseline needs a libstdc++ built with PSTL support and Intel TBB
-linked.** Not every environment has it — on MSYS2 the UCRT64 environment does
-and MINGW64 does not, silently running serial instead. Where PSTL is absent the
-engine falls back to its own `chunk_parallel_sort`, which measured between
-`__gnu_parallel` and the PSTL.
+**Measurement noise dominates smaller runs.** At 5M several scenarios showed 10
+to 22% spread between repeated measurements of the same engine, which is wider
+than most of the effects being measured. The 15M table above was taken when the
+machine was quiet, with every noise floor under 3.4%. Treat any published ratio
+narrower than its own noise column as a tie.
 
 ### Correctness
 
@@ -209,6 +212,29 @@ cargo test
 CXX=g++ cargo bench
 
 ```
+
+4. **C++ engine build switches**, all read from the environment so A/B
+   comparison never requires editing a source file. The active configuration is
+   echoed on every build.
+
+| Variable | Effect | Default |
+| :--- | :--- | :--- |
+| `MULTIMERGE_PSTL` | chaotic fallback via `std::execution::par`; needs PSTL support and TBB linked | off |
+| `MULTIMERGE_GNU` | chaotic fallback via `__gnu_parallel::stable_sort` | off |
+| *(neither)* | chaotic fallback via the internal `chunk_parallel_sort`, no dependency | — |
+| `MULTIMERGE_KWAY` | cache-blocked k-way merge; set to a power of two to change fan-out | on, 8 |
+| `MULTIMERGE_BIDIR` | bidirectional leaf merge | on |
+| `MULTIMERGE_TBB_SCHED` | merge tree via `tbb::parallel_invoke` | off |
+| `MULTIMERGE_TBB_REDUCE` | metadata fold via `tbb::parallel_reduce` | off |
+| `MULTIMERGE_TBB_MALLOC` | link `tbbmalloc_proxy` | off |
+
+**The engine does not depend on TBB.** Where PSTL is available it is the best
+fallback and worth enabling; where it is absent the internal path covers it. The
+three `TBB_*` switches were measured and made no difference on the test machine
+— they are kept so the experiment can be repeated on other hardware, not
+because they are recommended. Note that PSTL support varies by environment: on
+MSYS2 the UCRT64 environment has it and MINGW64 does not, silently running
+serial instead.
 
 
 

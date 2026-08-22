@@ -39,11 +39,108 @@
 #include <execution>
 #endif
 
+// ============================================================
+// CAMADA OPCIONAL DE TBB
+//
+// O motor NAO depende da TBB. Onde ela existe, alguns pontos podem usa-la;
+// onde nao existe, o caminho OpenMP original continua valendo, byte por byte.
+// Cada ponto e um interruptor separado, para poder ser medido isolado -- foi
+// assim que descobrimos que a escolha do fallback caotico valia mais que o
+// algoritmo do proprio motor.
+//
+//   -DMULTIMERGE_TBB          liga a camada (precisa de -ltbb / -ltbb12)
+//   -DMULTIMERGE_TBB_SCHED    arvore de merge com tbb::parallel_invoke
+//   -DMULTIMERGE_TBB_REDUCE   fold do metadata com tbb::parallel_reduce
+//
+// E ha um ganho que NAO precisa de macro nenhuma: lincar -ltbbmalloc_proxy
+// troca malloc/free globais pelo alocador escalavel da TBB. Isso importa
+// porque os std::stable_sort das folhas alocam POR CHAMADA, e com oito threads
+// isso vira contencao no alocador do sistema.
+//
+// POR QUE NAO E TUDO OU NADA. Trocar o escalonador do OpenMP pelo da TBB
+// transformaria uma dependencia opcional em obrigatoria. Com os interruptores
+// separados, quem nao tiver TBB compila e roda exatamente como antes.
+#if defined(MULTIMERGE_TBB)
+#include <tbb/parallel_invoke.h>
+#include <tbb/parallel_reduce.h>
+#include <tbb/blocked_range.h>
+#endif
+
 #ifdef MULTIMERGE_USE_GNU_PARALLEL
 #include <parallel/algorithm>
 #endif
 
 namespace multimerge {
+
+std::vector<int64_t> merge_metadata_pure(std::vector<int64_t> left,
+                                         const std::vector<int64_t>& right);
+
+namespace detail {
+
+/// Executa duas funcoes, em paralelo quando `paralelo` e verdadeiro.
+///
+/// Existe para que os pontos fork-join da arvore de merge nao precisem saber
+/// qual escalonador esta ativo. Sem TBB o corpo e identico ao `#pragma omp
+/// task` de antes, incluindo o `if(paralelo)` que decide inline vs tarefa.
+///
+/// O escalonador da TBB usa roubo de trabalho com fila dupla: a thread consome
+/// o proprio topo (LIFO, dados quentes em cache) e rouba da base alheia (FIFO,
+/// tarefa mais proxima da raiz, logo mais gorda). O `schedule(dynamic)` do
+/// OpenMP distribui de uma fila central -- balanceia igual, mas sem essa
+/// propriedade de localidade e com contencao no ponto central.
+///
+/// Se isso rende alguma coisa AQUI e uma pergunta empirica. Meça antes de
+/// concluir.
+template <typename F1, typename F2>
+inline void bifurca(bool paralelo, F1&& f1, F2&& f2) {
+#if defined(MULTIMERGE_TBB) && defined(MULTIMERGE_TBB_SCHED)
+    if (paralelo) {
+        tbb::parallel_invoke(std::forward<F1>(f1), std::forward<F2>(f2));
+    } else {
+        f1();
+        f2();
+    }
+#else
+    #pragma omp task if(paralelo)
+    { f1(); }
+    f2();
+    #pragma omp taskwait
+#endif
+}
+
+/// Combina os metadados dos blocos em um so.
+///
+/// A operacao e associativa -- e a propriedade que faz do metadata um MONOIDE,
+/// e ela existe justamente para permitir reducao em arvore. A versao sequencial
+/// percorre em ordem enquanto todos os nucleos esperam; a paralela reduz de
+/// fato em arvore.
+///
+/// Para dado bem estruturado o metadata e pequeno e o fold nao pesa. Para dado
+/// com muitos runs curtos, pesa. Meça antes de ligar.
+inline std::vector<int64_t> junta_metadata(std::vector<std::vector<int64_t>>& partes) {
+#if defined(MULTIMERGE_TBB) && defined(MULTIMERGE_TBB_REDUCE)
+    return tbb::parallel_reduce(
+        tbb::blocked_range<size_t>(0, partes.size()),
+        std::vector<int64_t>{},
+        [&](const tbb::blocked_range<size_t>& r, std::vector<int64_t> acc) {
+            for (size_t i = r.begin(); i != r.end(); ++i) {
+                acc = merge_metadata_pure(std::move(acc), partes[i]);
+            }
+            return acc;
+        },
+        [](std::vector<int64_t> a, std::vector<int64_t> b) {
+            return merge_metadata_pure(std::move(a), b);
+        });
+#else
+    std::vector<int64_t> combinado;
+    for (auto& parte : partes) {
+        combinado = merge_metadata_pure(std::move(combinado), parte);
+    }
+    return combinado;
+#endif
+}
+
+}  // namespace detail
 
     // ==========================================
     // PHASE 0: LOCAL ENTROPY SHIELD O(1)
@@ -174,11 +271,7 @@ namespace multimerge {
             local_meta[i] = generate_sequential_metadata(span);
         }
 
-        std::vector<int64_t> combined;
-        for (auto& meta : local_meta) {
-            combined = merge_metadata_pure(std::move(combined), meta);
-        }
-        return combined;
+        return detail::junta_metadata(local_meta);
     }
 
     template <typename T>
@@ -200,11 +293,7 @@ namespace multimerge {
             local_meta[i] = process_macro_block(arr.subspan(start, end - start));
         }
 
-        std::vector<int64_t> combined;
-        for (auto& meta : local_meta) {
-            combined = merge_metadata_pure(std::move(combined), meta);
-        }
-        return combined;
+        return detail::junta_metadata(local_meta);
     }
 
     // ==========================================
