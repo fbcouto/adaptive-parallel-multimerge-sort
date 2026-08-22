@@ -10,6 +10,8 @@ fn main() {
     println!("cargo:rerun-if-env-changed=MULTIMERGE_KWAY");
     println!("cargo:rerun-if-env-changed=MULTIMERGE_BIDIR");
     println!("cargo:rerun-if-env-changed=MULTIMERGE_GNU");
+    println!("cargo:rerun-if-env-changed=MULTIMERGE_PSTL");
+    println!("cargo:rerun-if-env-changed=MULTIMERGE_TBB_LIB");
     println!("cargo:rerun-if-env-changed=MULTIMERGE_NATIVE");
 
     let mut build = cc::Build::new();
@@ -37,12 +39,38 @@ fn main() {
         .flag("-O3")
         .flag("-fopenmp");
 
-    // Fallback engine for high-entropy data. ON by default uses
-    // __gnu_parallel::stable_sort; set MULTIMERGE_GNU=0 to use the internal
-    // chunk_parallel_sort instead.
+    // Fallback engine for high-entropy data. OFF by default: the internal
+    // chunk_parallel_sort beat __gnu_parallel::stable_sort in 30 of 36 measured
+    // combinations (block size x N x thread count), and the margin grows with
+    // parallelism -- at 8 threads it reached -46% on sawtooth and -27% on low
+    // cardinality. The six losses were all on pure random data and were small
+    // enough to sit inside the measurement noise.
+    //
+    // Turning it off also drops the dependency on <parallel/algorithm>, which is
+    // what forces the GNU toolchain. Set MULTIMERGE_GNU=1 to compare.
     let gnu = std::env::var("MULTIMERGE_GNU")
-        .map(|v| !v.is_empty() && v != "0").unwrap_or(true);
-    if gnu { build.define("MULTIMERGE_USE_GNU_PARALLEL", None); }
+        .map(|v| !v.is_empty() && v != "0").unwrap_or(false);
+
+    // Preferred fallback: std::stable_sort(std::execution::par, ...). Measured
+    // at 5M with 8 threads it beat __gnu_parallel by 29-48% on every chaotic
+    // scenario, and the engine was losing 62-88% to it on random data purely
+    // because it delegated to the slower one.
+    //
+    // OFF by default because it needs both a libstdc++ built with PSTL support
+    // and Intel TBB linked. On MSYS2 the UCRT64 environment has it and MINGW64
+    // does not, so it cannot be assumed. Enable with:
+    //     $env:MULTIMERGE_PSTL = "1"
+    // and make sure TBB is installed (pacman -S mingw-w64-x86_64-tbb, or
+    // apt install libtbb-dev). The library name varies: libtbb12 on recent
+    // MSYS2, libtbb elsewhere.
+    let pstl = std::env::var("MULTIMERGE_PSTL")
+        .map(|v| !v.is_empty() && v != "0").unwrap_or(false);
+    if pstl {
+        build.define("MULTIMERGE_PSTL", None);
+        let lib = std::env::var("MULTIMERGE_TBB_LIB").unwrap_or_else(|_| "tbb12".to_string());
+        println!("cargo:rustc-link-lib={lib}");
+    }
+    if gnu && !pstl { build.define("MULTIMERGE_USE_GNU_PARALLEL", None); }
 
     // Cache-blocked k-way merge. ON by default.
     // Disable for A/B benchmarking with:
@@ -84,7 +112,7 @@ fn main() {
     // run against a different build than intended; this line makes the mode
     // visible in normal cargo output.
     println!(
-        "cargo:warning=multimerge C++ engine: kway={} fanout={} bidir={} gnu_parallel={} native={}",
+        "cargo:warning=multimerge C++ engine: kway={} fanout={} bidir={} fallback={} native={}",
         if kway_on { "ON" } else { "off" },
         if kway_on && kway.parse::<u32>().map(|k| k > 1).unwrap_or(false) {
             kway.clone()
@@ -94,7 +122,9 @@ fn main() {
             "-".to_string()
         },
         if bidir { "ON" } else { "off" },
-        if gnu { "ON" } else { "off (chunk_parallel_sort)" },
+        if pstl { "std::execution::par (PSTL+TBB)" }
+        else if gnu { "__gnu_parallel" }
+        else { "chunk_parallel_sort (interno)" },
         if native { "ON" } else { "off" }
     );
 

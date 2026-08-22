@@ -4,7 +4,7 @@ A high-performance, L1-cache optimized, hybrid stable parallel sorting algorithm
 
 The algorithm is built on a single observation: real database keys are almost never random. They arrive as long monotone stretches — an index being rebuilt, sorted segments being consolidated, a table appended in insertion order. A general-purpose sort throws that structure away and pays `n log n` regardless. This engine detects the structure first, in one linear pass, and only sorts what actually needs sorting.
 
-On structured datasets it exceeds **1 Gelem/s** (one billion elements per second) on modern CPUs, and it outperforms highly-optimized libraries such as Rust's `rayon` on data containing many overlapping runs — the real-world relational database scenario.
+Against `std::stable_sort(std::execution::par, ...)` — the parallel stable sort of the C++17 standard library — it ties on every scenario measured and is **3.5x to 12x faster when the data already carries global order**: a rebuilt index, a table in insertion order, a segment merged by a previous operation. On already-sorted input it exceeds **1.5 Gelem/s**, which is the cost of reading the array once and discovering there is nothing to do.
 
 # 📚 Academic Background & Prior Work
 
@@ -23,7 +23,9 @@ The engine runs in two phases: a linear **detection** pass that discovers the st
 
 ### 1. O(1) Entropy Shield (Phase 0)
 
-Before anything else, the engine samples roughly 100 consecutive elements near the midpoint of the array and counts direction changes. If the sample looks like noise, there is no structure to exploit and the run detector would only waste memory building metadata for millions of two-element runs. In that case the engine bails out immediately to a specialized parallel fallback: `rayon::par_sort` in Rust, and either `__gnu_parallel::stable_sort` or the internal `chunk_parallel_sort` in C++, selected at build time.
+Before anything else, the engine samples roughly 100 consecutive elements near the midpoint of the array and counts direction changes. If the sample looks like noise, there is no structure to exploit and the run detector would only waste memory building metadata for millions of two-element runs. In that case the engine bails out immediately to a parallel fallback: `rayon::par_sort` in Rust, and in C++ one of three, selected at build time.
+
+**Which fallback is chosen matters more than it looks.** Measured at 5M with 8 threads, `std::stable_sort(std::execution::par, ...)` ran 29–48% faster than `__gnu_parallel::stable_sort` on every chaotic scenario. With the GNU extension as the fallback the whole engine trailed the C++17 parallel sort by 62–88% on random input — not because of its own code, but because of where it delegated. The preference order is now PSTL first, the internal `chunk_parallel_sort` second, and `__gnu_parallel` only on explicit request.
 
 This is a constant-cost bet made on a small sample. It is cheap by design — the cost of being wrong is bounded by the fallback, which is a competent parallel sort in its own right.
 
@@ -69,9 +71,11 @@ Instead, each output tile is partitioned across all `k` runs with **multi-sequen
 
 The strategy is **hybrid by size**: k-way applies only above a threshold where a merge exceeds cache. Below it, the binary path is faster — it has no partitioning overhead, it keeps the shortcut that turns an already-ordered merge into a copy, and it is where the bidirectional merge operates. Adjacent groups that are already in order are coalesced into a single stream before merging, so the shortcut survives k-way as well.
 
-### 5. Initialization Elision
+### 5. Buffer Allocation
 
-The scratch buffer for `Copy` types is allocated without being zero-filled (`unsafe { buffer.set_len(n) }` in Rust, `std::make_unique_for_overwrite` in C++). Every position is written by the merge before it is ever read, so the OS is never asked to zero gigabytes of RAM that are about to be overwritten.
+The scratch buffer in C++ is allocated with `std::make_unique_for_overwrite`, which for trivial types does not touch the memory: pages are faulted in by the merge itself, and the OS is never asked to zero gigabytes of RAM about to be overwritten.
+
+**The Rust side used to do the same and no longer does.** `Vec::with_capacity` followed by `set_len` was measured at 20M elements and saved 1 ms out of 458 — nothing, because the merge writes every position anyway and the page faults happen either way. It also made the safe public API unsound: `T: Copy` does not imply that every bit pattern is a valid value, and `bool`, `char`, `NonZeroU64` and `&str` are all `Copy` while rejecting most patterns. `vec![arr[0]; n]` is used instead, which compiles to `alloc_zeroed` when the value is zero in bits and costs nothing measurable when it is not.
 
 ### Stability
 
@@ -81,74 +85,90 @@ The engine is **stable end to end**, and every phase is built to keep it that wa
 
 ## 📊 Benchmarks
 
-Rust engine against `rayon::par_sort` (stable), `u64` keys, Criterion with 20
-samples per point. Ratios are Rayon time divided by MultiMerge time, so higher
-is better.
+C++ engine, `{key, index}` pairs of 16 bytes, 5M elements, 8 threads. Median of
+9 runs with rotating order between engines and a control row that measures one
+engine twice to expose the noise floor. Every output is checked element by
+element against `std::stable_sort`, including the original index, so a wrong
+answer cannot be mistaken for a fast one.
 
-| Scenario | 1M | 5M | 10M | 30M |
+The reference is **`std::stable_sort(std::execution::par, ...)`** — the parallel
+stable sort of the C++17 standard library, backed by Intel TBB. It is the
+strongest baseline available, and the honest one: comparing an 8-thread engine
+against the single-threaded `std::stable_sort` measures parallelism, not
+algorithm.
+
+| Scenario | `std::stable_sort` | C++17 `par` | MultiMerge | vs `par` |
 | :--- | ---: | ---: | ---: | ---: |
-| **Sawtooth** (1000-element teeth) | 0.96× | **1.50×** | **1.45×** | **1.32×** |
-| Fully sorted | 1.02× | 1.01× | 1.01× | 1.00× |
-| Reversed | 1.09× | 0.94× | 0.99× | 0.96× |
-| Random | 0.99× | 1.02× | 1.00× | 1.00× |
-| Low cardinality | 1.01× | 1.04× | 0.96× | 1.00× |
+| **Already sorted** | 291.9 ms | 11.4 ms | **3.3 ms** | **−71%** |
+| **Reversed** | 299.6 ms | 122.4 ms | **10.4 ms** | **−92%** |
+| Almost sorted (0.1% noise) | 291.7 ms | 148.0 ms | 138.1 ms | −6.7% |
+| Sawtooth (`i % 1000`) | 276.1 ms | 127.9 ms | 130.6 ms | +2.1% |
+| Random, high cardinality | 675.4 ms | 169.3 ms | 160.5 ms | −5.2% |
+| Random, 64 distinct keys | 417.9 ms | 132.0 ms | 136.3 ms | +3.3% |
+| Random, 10 distinct keys | 385.3 ms | 128.7 ms | 132.3 ms | +2.8% |
 
-Absolute throughput at 30M elements:
-
-| Scenario | Rayon | MultiMerge |
-| :--- | ---: | ---: |
-| Fully sorted | 1.114 Gelem/s | 1.114 Gelem/s |
-| Reversed | 638.8 Melem/s | 614.8 Melem/s |
-| Sawtooth | 102.6 Melem/s | **135.5 Melem/s** |
-| Low cardinality | 54.0 Melem/s | 53.9 Melem/s |
-| Random | 52.4 Melem/s | 52.3 Melem/s |
+Noise floor per scenario: 1.0% to 4.0%.
 
 ### What the numbers say
 
-**The advantage is structural, and it needs scale.** The engine wins where the
-data contains many overlapping sorted runs — the sawtooth case — and the win
-appears only above roughly two to three million elements. Below that, the
-cache-blocked k-way merge engages for at most one level before the sub-ranges
-drop under its 2 MB threshold, and it does not get the chance to pay for
-itself. This is a property of the design, not a tuning accident: the k-way path
-exists to cut passes over DRAM, and small arrays never leave cache.
+**Global order is where the engine is untouchable.** Already-sorted data
+finishes in 3.3 ms against 11.4 for the standard parallel sort — 3.5x — and
+reversed data in 10.4 against 122.4, nearly 12x. Neither is a faster sort: the
+detection pass finds a single run and the engine returns without sorting at all,
+or reverses once in parallel. No comparison sort can match that, because it must
+at minimum compare.
 
-**Where there is no structure to exploit, it matches the baseline.** Across the
-four non-sawtooth scenarios the largest deviation in either direction is 4%,
-and at the extremes of the size range it is under 1%. That symmetry matters
-more than the peak number: an adaptive sort that sometimes loses badly is not
-usable as a general replacement. The entropy shield exists precisely to make
-this true — when the sample says the data is noise, the engine steps aside.
+This is not a synthetic corner. It is the shape of a rebuilt index, a table read
+in insertion order, a segment already merged by a previous operation — the
+common case in a database, and the one a general-purpose sort pays full price
+for.
 
-**Random is the same code.** On chaotic input the Rust engine delegates to
-`rayon::par_sort`, so the 1.00× row is an identity, not a contest. It is
-reported here because it is the control: if those numbers had diverged, the
-measurement itself would be suspect.
+**Everywhere else it ties.** The five remaining scenarios land between −6.7% and
++3.3%, and every one of those differences sits at or below the noise floor of
+its own row. That symmetry is the point: an adaptive sort that sometimes loses
+badly cannot replace a general one. The entropy shield exists to make this true
+— when the sample says the data is noise, the engine steps aside and delegates.
 
-**The 1 Gelem/s figure is real but shared.** Both engines reach 1.114 Gelem/s
-on fully sorted data at 30M, which is the memory bandwidth ceiling of the test
-machine rather than an algorithmic result. Detection is a single linear pass;
-there is nothing left to optimize once the array is read once.
+**Being honest about sawtooth and almost-sorted.** Against
+`__gnu_parallel::stable_sort` these two scenarios showed the engine 43–47%
+ahead. Against the C++17 `par` they are a tie. The earlier margin was largely a
+margin over a weaker implementation, not a structural advantage. Reporting only
+the favourable baseline would have overstated the case by a factor of ten.
+
+**The fallback choice mattered more than the algorithm.** On random input the
+engine was losing 62–88% to the C++17 `par` — not because its own code was slow,
+but because the entropy shield delegated to `__gnu_parallel`, which is 29–48%
+slower than the PSTL implementation on every chaotic scenario measured. Pointing
+the shield at the better fallback closed the entire gap.
 
 ### Caveats
 
-Sawtooth at 30M and low cardinality at 10M were the noisiest points, with 12%
-and 16% spread between the confidence bounds and several severe outliers. Treat
-those two ratios as approximate.
+**These numbers are from one machine**, an 8-core laptop, at one size. The cache
+budgets, the block size and the k-way threshold were all tuned there and should
+be re-measured on the target hardware.
 
-The sawtooth pattern (`i % 1000`) is worth naming honestly: every run ends at
-its maximum and the next begins at its minimum, so adjacent runs overlap
-completely in range. Measured by comparison count, it is the *worst* case for an
-adaptive merge, not a typical one — the shortcut that turns an already-ordered
-merge into a copy never fires. Real database workloads, where sorted segments
-tend to overlap only partially, land between this and the fully sorted case.
+**The sawtooth pattern (`i % 1000`) is the worst case for adaptive merging**, not
+a typical one: every run ends at its maximum and the next begins at its minimum,
+so adjacent runs overlap completely in range and the shortcut that turns an
+already-ordered merge into a copy never fires. Real workloads, where sorted
+segments overlap only partially, land between this and the fully sorted case.
+
+**The `par` baseline needs a libstdc++ built with PSTL support and Intel TBB
+linked.** Not every environment has it — on MSYS2 the UCRT64 environment does
+and MINGW64 does not, silently running serial instead. Where PSTL is absent the
+engine falls back to its own `chunk_parallel_sort`, which measured between
+`__gnu_parallel` and the PSTL.
 
 ### Correctness
 
-Every release is checked by three independent layers:
+Every release is checked by four independent layers:
 
-- 16 unit and integration tests, including stability under duplicate keys,
-  descending runs with plateaus, and a 150-case structured/chaotic fuzz
+- 9 unit tests plus a 7-case integration suite in Rust, covering the metadata
+  monoid, stability under duplicate keys, descending runs with plateaus, block
+  boundary sizes, and a 150-case structured/chaotic fuzz
+- A C++ stability suite over the same patterns, verifying that equal keys keep
+  their original relative order and that the output is byte-identical to
+  `std::stable_sort`
 - A cross-check binary that sorts identical inputs with all three engines
   (Rayon, MultiMerge Rust, MultiMerge C++) across six data patterns and compares
   every output against `slice::sort` as an independent reference

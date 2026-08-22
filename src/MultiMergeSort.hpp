@@ -11,6 +11,34 @@
 #include <memory>
 #include <type_traits>
 
+// ============================================================
+// FALLBACK PARA ENTRADA CAOTICA
+//
+// Quando o escudo de entropia decide que nao ha estrutura a explorar, o motor
+// entrega o array a um sort estavel paralelo de terceiros. A escolha importa
+// mais do que parece: medido em 5M com 8 threads, as tres opcoes ficaram longe
+// uma da outra.
+//
+//   std::execution::par   126-161 ms   <- melhor
+//   __gnu_parallel        228-240 ms   +29 a +48%
+//   chunk_parallel_sort   (proprio, entre os dois)
+//
+// Com o __gnu_parallel o motor perdia 62 a 88% para o par do C++17 em dado
+// aleatorio -- nao pelo algoritmo, mas por delegar para o fallback errado.
+//
+// A ordem de preferencia e: PSTL, depois o interno, e o __gnu_parallel so por
+// pedido explicito. O PSTL exige libstdc++ com suporte E a Intel TBB lincada;
+// no MSYS2, por exemplo, o ambiente UCRT64 tem e o MINGW64 nao. Por isso ele e
+// opcional, e o caminho interno cobre quem nao tiver.
+//
+//   -DMULTIMERGE_PSTL          usa std::execution::par   (precisa de -ltbb)
+//   -DMULTIMERGE_USE_GNU_PARALLEL  usa __gnu_parallel
+//   nenhum dos dois                usa chunk_parallel_sort
+// ============================================================
+#if defined(MULTIMERGE_PSTL)
+#include <execution>
+#endif
+
 #ifdef MULTIMERGE_USE_GNU_PARALLEL
 #include <parallel/algorithm>
 #endif
@@ -739,10 +767,45 @@ namespace multimerge {
         }
     }
 
+    /// Comprimento do bloco pre-ordenado no caminho caotico.
+    ///
+    /// CONSTANTE, nao formula. A varredura de 36 combinacoes (bloco x N x
+    /// threads, ruido de 0,1% a 15%) mostrou que a superficie e RASA: qualquer
+    /// bloco entre ~8K e ~131K fica a menos de 10% do otimo, e o "otimo" de
+    /// cada linha varia sem tendencia -- em 10M com 8 threads o caso aleatorio
+    /// escolhe 32768 e o de baixa cardinalidade escolhe 1024, os dois extremos.
+    /// Uma formula com L3 e contagem de threads erraria por 0 a 22% um alvo que
+    /// nao existe, e exigiria consultar o tamanho da L3, que nao tem forma
+    /// portavel de ser obtido.
+    ///
+    /// 65536 foi o valor mais frequente entre os otimos medidos e fica dentro
+    /// de 10% do melhor em quase todas as combinacoes.
+    ///
+    /// O que o bloco NAO deve ser e pequeno demais: ele multiplica o numero de
+    /// runs, e cada nivel de merge a mais custa uma varredura inteira da DRAM,
+    /// que e o gargalo desta carga. O valor anterior era 2000.
+    ///
+    /// Para fixar outro valor e comparar: -DMULTIMERGE_CHUNK=<n>
+    template <typename T>
+    inline size_t chunk_length_for(size_t n) {
+#if defined(MULTIMERGE_CHUNK)
+        (void)n;
+        return (size_t)(MULTIMERGE_CHUNK);
+#else
+        constexpr size_t ALVO = 65536;
+        // Teto de balanceamento: ao menos dois blocos por thread, senao arrays
+        // pequenos geram menos blocos que nucleos e a ultima rodada deixa
+        // gente parada.
+        const size_t threads = (size_t)std::max(1, omp_get_max_threads());
+        const size_t por_balanco = n / (threads * 2 + 1);
+        return std::clamp<size_t>(std::min(ALVO, por_balanco), 1024, ALVO);
+#endif
+    }
+
     template <typename T>
     void chunk_parallel_sort(std::span<T> arr, size_t leaf_size) {
         size_t n = arr.size();
-        const size_t CHUNK_LENGTH = 2000; 
+        const size_t CHUNK_LENGTH = chunk_length_for<T>(n);
 
         size_t num_chunks = (n + CHUNK_LENGTH - 1) / CHUNK_LENGTH;
 
@@ -786,9 +849,12 @@ namespace multimerge {
             return;
         }
 
-        // Failsafe for complete chaos (random sequences)
+        // Failsafe for complete chaos (random sequences).
+        // Ver a nota no topo do arquivo: a ordem de preferencia foi medida.
         if (evaluate_local_entropy(arr)) {
-#if defined(MULTIMERGE_USE_GNU_PARALLEL)
+#if defined(MULTIMERGE_PSTL)
+            std::stable_sort(std::execution::par, arr.begin(), arr.end());
+#elif defined(MULTIMERGE_USE_GNU_PARALLEL)
             __gnu_parallel::stable_sort(arr.begin(), arr.end());
 #else
             chunk_parallel_sort(arr, leaf_size);
