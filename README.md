@@ -229,12 +229,26 @@ CXX=g++ cargo bench
 | `MULTIMERGE_TBB_MALLOC` | link `tbbmalloc_proxy` | off |
 
 **The engine does not depend on TBB.** Where PSTL is available it is the best
-fallback and worth enabling; where it is absent the internal path covers it. The
-three `TBB_*` switches were measured and made no difference on the test machine
-— they are kept so the experiment can be repeated on other hardware, not
-because they are recommended. Note that PSTL support varies by environment: on
-MSYS2 the UCRT64 environment has it and MINGW64 does not, silently running
-serial instead.
+fallback and worth enabling; where it is absent the internal `chunk_parallel_sort`
+covers it with no external dependency. The three `TBB_*` switches were measured
+and made no difference on the test machine — they are kept so the experiment can
+be repeated on other hardware, not because they are recommended.
+
+**PSTL availability varies, which is why it is off by default.**
+
+| Platform | Parallel policies | Install |
+| :--- | :--- | :--- |
+| Linux, GCC ≥ 9 + libstdc++ | yes | `apt install libtbb-dev`, link `-ltbb` |
+| MSYS2 **UCRT64** | yes | `pacman -S mingw-w64-ucrt-x86_64-tbb`, link `-ltbb12` |
+| MSYS2 **MINGW64** | no | — |
+| Clang + libc++ | incomplete | — |
+
+The failure mode is quiet: without a working PSTL the `std::execution::par`
+overloads still compile and simply run serial, because the standard only says
+`par` *may* parallelise. Verify before trusting a measurement — if the parallel
+policy is not at least twice as fast as the sequential `std::stable_sort`, it did
+not engage. `src/vs_stable.cpp` performs exactly this check and prints a warning
+when the ratio looks wrong.
 
 
 
