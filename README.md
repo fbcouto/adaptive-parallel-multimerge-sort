@@ -111,32 +111,32 @@ Four things changed in the shared machinery.
 - **The tree only runs when it pays**: when, after joining, runs average at least 256 elements for cheap comparisons or 48 for expensive ones. Below that the block path ties or wins. Detection gives up early once the data proves too fragmented, so asking costs a fraction of a pass.
 - **The sample is eight windows spread over the array**, not one in the middle, and ties do not count as a direction — `4 4 3 3 2 2` used to read as pure chaos. The same sample times its own 512 comparisons to tell a cheap key from an expensive one; a preemption can only make a cheap key look expensive, which only withholds a shortcut.
 
-Measured on 10M `u64`, 8 threads (i7-7700HQ, 4 cores), by `examples/vs_rayon.rs`: median of 15 rounds after a discarded warm-up, a fresh copy of the data outside the timer, and the order of the contenders drawn at random in every round. Each table of this README was measured twice, in two separate processes, and each cell is the lower of the two medians, because interference only ever adds time. The two Rayon sorts come first, then the two of this crate; the first ratio column compares the stable pair (`par_sort` against `sort_stable`) and the second the unstable pair (`par_sort_unstable` against `sort`). `sort_stable` runs twice in every round and the gap between its two medians is the noise floor of the row, 0.7% to 8%; a ratio reads *tie* when the difference fits inside that floor (5% at least) or is under 1 ms. The fastest time of each row is in large bold blue (rendered by GitHub's math extension; other Markdown viewers may show the raw markup):
+Measured on 10M `u64`, 8 threads (i7-7700HQ, 4 cores), by `examples/vs_rayon.rs`: median of 15 rounds after a discarded warm-up, a fresh copy of the data outside the timer, and the order of the contenders drawn at random in every round. Each table of this README was measured twice, in two separate processes, and each cell is the lower of the two medians, because interference only ever adds time. Each row has two bands. The first is the stable pair: Rayon's `par_sort` against this crate's `sort_stable`, shown as `MM_sort_stable`. The second is the unstable pair: Rayon's `par_sort_unstable` against this crate's `sort`, shown as `MM_sort`. The column after each pair says how many times faster the `MM_` entry is. `sort_stable` runs twice in every round and the gap between its two medians is the noise floor of the row, 0.7% to 8%; a ratio reads *tie* when the difference fits inside that floor (5% at least) or is under 1 ms. In each band the winner is in large bold blue (rendered by GitHub's math extension; other Markdown viewers may show the raw markup); where the ratio reads *tie*, the blue only marks the lower of two numbers the measurement cannot tell apart:
 
-| Scenario | `par_sort` | `par_sort_unstable` | | `sort_stable` | `sort` | |
+| Scenario | `par_sort` | `MM_sort_stable` | | `par_sort_unstable` | `MM_sort` | |
 | :--- | ---: | ---: | ---: | ---: | ---: | ---: |
-| already sorted | 4.4 ms | 8.7 ms | tie | ${\color{blue}\Large\textbf{3.8 ms}}$ | ${\color{blue}\Large\textbf{3.8 ms}}$ | **2.3x** |
-| reversed | 13.8 ms | 18.8 ms | 1.16x | 11.9 ms | ${\color{blue}\Large\textbf{11.7 ms}}$ | **1.61x** |
-| reversed, repeated keys | 123.4 ms | 52.9 ms | **5.5x** | 22.5 ms | ${\color{blue}\Large\textbf{13.4 ms}}$ | **3.9x** |
-| sawtooth, disjoint ranges | 111.8 ms | 50.4 ms | **12x** | 9.3 ms | ${\color{blue}\Large\textbf{8.9 ms}}$ | **5.7x** |
-| 2 interleaved runs | 43.8 ms | 103.4 ms | 1.06x | 41.4 ms | ${\color{blue}\Large\textbf{40.7 ms}}$ | **2.5x** |
-| 64 interleaved runs | 105.5 ms | 151.0 ms | **1.21x** | ${\color{blue}\Large\textbf{87.2 ms}}$ | 87.4 ms | **1.73x** |
-| sorted + 400 chaotic elements | ${\color{blue}\Large\textbf{36.4 ms}}$ | 91.3 ms | 0.93x | 39.2 ms | 40.2 ms | **2.3x** |
-| almost sorted (1% swapped) | 162.0 ms | 62.3 ms | 1.10x | 147.9 ms | ${\color{blue}\Large\textbf{62.2 ms}}$ | tie |
-| random, 64 distinct keys | 204.8 ms | ${\color{blue}\Large\textbf{67.9 ms}}$ | **2.1x** | 99.7 ms | 68.4 ms | tie |
-| random, high cardinality | 217.2 ms | ${\color{blue}\Large\textbf{123.7 ms}}$ | **1.21x** | 180.0 ms | 127.2 ms | tie |
-| random + 400 sorted in the middle | 216.7 ms | 126.3 ms | **1.23x** | 176.7 ms | ${\color{blue}\Large\textbf{125.3 ms}}$ | tie |
+| already sorted | 4.4 ms | ${\color{blue}\Large\textbf{3.8 ms}}$ | tie | 8.7 ms | ${\color{blue}\Large\textbf{3.8 ms}}$ | **2.3x** |
+| reversed | 13.8 ms | ${\color{blue}\Large\textbf{11.9 ms}}$ | 1.16x | 18.8 ms | ${\color{blue}\Large\textbf{11.7 ms}}$ | **1.61x** |
+| reversed, repeated keys | 123.4 ms | ${\color{blue}\Large\textbf{22.5 ms}}$ | **5.5x** | 52.9 ms | ${\color{blue}\Large\textbf{13.4 ms}}$ | **3.9x** |
+| sawtooth, disjoint ranges | 111.8 ms | ${\color{blue}\Large\textbf{9.3 ms}}$ | **12x** | 50.4 ms | ${\color{blue}\Large\textbf{8.9 ms}}$ | **5.7x** |
+| 2 interleaved runs | 43.8 ms | ${\color{blue}\Large\textbf{41.4 ms}}$ | 1.06x | 103.4 ms | ${\color{blue}\Large\textbf{40.7 ms}}$ | **2.5x** |
+| 64 interleaved runs | 105.5 ms | ${\color{blue}\Large\textbf{87.2 ms}}$ | **1.21x** | 151.0 ms | ${\color{blue}\Large\textbf{87.4 ms}}$ | **1.73x** |
+| sorted + 400 chaotic elements | ${\color{blue}\Large\textbf{36.4 ms}}$ | 39.2 ms | 0.93x | 91.3 ms | ${\color{blue}\Large\textbf{40.2 ms}}$ | **2.3x** |
+| almost sorted (1% swapped) | 162.0 ms | ${\color{blue}\Large\textbf{147.9 ms}}$ | 1.10x | 62.3 ms | ${\color{blue}\Large\textbf{62.2 ms}}$ | tie |
+| random, 64 distinct keys | 204.8 ms | ${\color{blue}\Large\textbf{99.7 ms}}$ | **2.1x** | ${\color{blue}\Large\textbf{67.9 ms}}$ | 68.4 ms | tie |
+| random, high cardinality | 217.2 ms | ${\color{blue}\Large\textbf{180.0 ms}}$ | **1.21x** | ${\color{blue}\Large\textbf{123.7 ms}}$ | 127.2 ms | tie |
+| random + 400 sorted in the middle | 216.7 ms | ${\color{blue}\Large\textbf{176.7 ms}}$ | **1.23x** | 126.3 ms | ${\color{blue}\Large\textbf{125.3 ms}}$ | tie |
 
 On 2M `&str` keys (median of 9 rounds) the gap against the unstable quicksort is wider, because comparisons dominate:
 
-| Scenario | `par_sort` | `par_sort_unstable` | | `sort_stable` | `sort` | |
+| Scenario | `par_sort` | `MM_sort_stable` | | `par_sort_unstable` | `MM_sort` | |
 | :--- | ---: | ---: | ---: | ---: | ---: | ---: |
-| 2 interleaved runs | 90.1 ms | 556.6 ms | 1.14x | ${\color{blue}\Large\textbf{78.8 ms}}$ | 78.9 ms | **7.1x** |
-| 8 interleaved runs | 176.2 ms | 2,040 ms | **1.55x** | 113.8 ms | ${\color{blue}\Large\textbf{111.8 ms}}$ | **18x** |
-| 64 interleaved runs | 324.9 ms | 1,223 ms | **1.78x** | ${\color{blue}\Large\textbf{183.0 ms}}$ | 183.8 ms | **6.7x** |
-| almost sorted (1% swapped) | 389.5 ms | 640.2 ms | **1.36x** | 287.3 ms | ${\color{blue}\Large\textbf{283.8 ms}}$ | **2.3x** |
-| random, 64 distinct strings | 113.2 ms | ${\color{blue}\Large\textbf{59.7 ms}}$ | **1.67x** | 67.9 ms | 61.8 ms | tie |
-| random | ${\color{blue}\Large\textbf{296.8 ms}}$ | 316.6 ms | tie | 308.4 ms | 320.0 ms | tie |
+| 2 interleaved runs | 90.1 ms | ${\color{blue}\Large\textbf{78.8 ms}}$ | 1.14x | 556.6 ms | ${\color{blue}\Large\textbf{78.9 ms}}$ | **7.1x** |
+| 8 interleaved runs | 176.2 ms | ${\color{blue}\Large\textbf{113.8 ms}}$ | **1.55x** | 2,040 ms | ${\color{blue}\Large\textbf{111.8 ms}}$ | **18x** |
+| 64 interleaved runs | 324.9 ms | ${\color{blue}\Large\textbf{183.0 ms}}$ | **1.78x** | 1,223 ms | ${\color{blue}\Large\textbf{183.8 ms}}$ | **6.7x** |
+| almost sorted (1% swapped) | 389.5 ms | ${\color{blue}\Large\textbf{287.3 ms}}$ | **1.36x** | 640.2 ms | ${\color{blue}\Large\textbf{283.8 ms}}$ | **2.3x** |
+| random, 64 distinct strings | 113.2 ms | ${\color{blue}\Large\textbf{67.9 ms}}$ | **1.67x** | ${\color{blue}\Large\textbf{59.7 ms}}$ | 61.8 ms | tie |
+| random | ${\color{blue}\Large\textbf{296.8 ms}}$ | 308.4 ms | tie | ${\color{blue}\Large\textbf{316.6 ms}}$ | 320.0 ms | tie |
 
 Where there is no structure, `sort` *is* Rayon's quicksort plus a 512-comparison sample, so a tie is the ceiling. Where there is, it does not sort: it reverses, joins or merges. The ceiling goes away when the caller tells the engine what the key bits are: see section 7.
 
@@ -162,21 +162,21 @@ Nothing changes for ordered input: the sample, the run detector and the merge tr
 
 The routine returns without having moved a single element whenever it gives up — skewed keys, a dominant bucket, no memory for the buffer — and the comparison path takes over as before. One MSD pass rather than a full LSD sort is what makes it independent of key width: a pure LSD sort sweeps the whole array twice per key byte and loses to the quicksort on `u64`.
 
-Measured on 30M elements, 8 threads (i7-7700HQ, 4 cores), by `examples/vs_rayon_radix.rs`, in ms: the minimum of 5 rounds after a discarded warm-up, the order of the contenders drawn at random in every round, a fresh copy of the data outside the timer; measured twice, each cell the lower of the two. One contender runs twice in every round: that pair differs by 0.4% to 2.3% on the rows above 100 ms and by up to 9% on the rows of a few tens of milliseconds.
+Measured on 30M elements, 8 threads (i7-7700HQ, 4 cores), by `examples/vs_rayon_radix.rs`, in ms: the minimum of 5 rounds after a discarded warm-up, the order of the contenders drawn at random in every round, a fresh copy of the data outside the timer; measured twice, each cell the lower of the two. One contender runs twice in every round: that pair differs by 0.4% to 2.3% on the rows above 100 ms and by up to 9% on the rows of a few tens of milliseconds. The columns are the same two bands, stable and then unstable, each with a third column for the radix entry; `MM_` marks the entries of this crate, and the winner of each band is in blue.
 
-| 30M elements | `par_sort_unstable` | `sort` | `sort_radix` | | `par_sort` | `sort_stable` | `sort_stable_radix` | |
+| 30M elements | `par_sort` | `MM_sort_stable` | `MM_sort_stable_radix` | | `par_sort_unstable` | `MM_sort` | `MM_sort_radix` | |
 | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `i32`, random | 364 | 362 | 160 | **2.3x** | 482 | 468 | ${\color{blue}\Large\textbf{155}}$ | **3.0x** |
-| `i32`, 64 distinct values | 128 | 130 | ${\color{blue}\Large\textbf{25}}$ | **5.2x** | 446 | 190 | 27 | **7.0x** |
-| `i32`, skewed (90% of the keys in 0..1000) | 180 | ${\color{blue}\Large\textbf{179}}$ | 181 | tie | 476 | 275 | 273 | tie |
-| `i32`, already sorted | 17.9 | ${\color{blue}\Large\textbf{7.2}}$ | 7.8 | tie | 8.9 | 7.9 | 7.6 | tie |
-| `u64`, random | 394 | 398 | ${\color{blue}\Large\textbf{293}}$ | **1.36x** | 701 | 572 | 326 | **1.75x** |
-| `u64`, 64 distinct values | 187 | 181 | 44 | **4.2x** | 641 | 274 | ${\color{blue}\Large\textbf{43}}$ | **6.3x** |
-| `u64`, skewed (90% of the keys in 0..1000) | 278 | ${\color{blue}\Large\textbf{277}}$ | 282 | tie | 682 | 359 | 361 | tie |
-| `{u64 key, u64 row}`, random, by key | 639 | 642 | ${\color{blue}\Large\textbf{527}}$ | **1.22x** | 1240 | 1282 | 612 | **2.1x** |
-| `{u64 key, u64 row}`, 64 distinct keys, by key | 344 | 344 | ${\color{blue}\Large\textbf{310}}$ | 1.11x | 1121 | 694 | 322 | **2.2x** |
+| `i32`, random | 482 | 468 | ${\color{blue}\Large\textbf{155}}$ | **3.0x** | 364 | 362 | ${\color{blue}\Large\textbf{160}}$ | **2.3x** |
+| `i32`, 64 distinct values | 446 | 190 | ${\color{blue}\Large\textbf{27}}$ | **7.0x** | 128 | 130 | ${\color{blue}\Large\textbf{25}}$ | **5.2x** |
+| `i32`, skewed (90% of the keys in 0..1000) | 476 | 275 | ${\color{blue}\Large\textbf{273}}$ | tie | 180 | ${\color{blue}\Large\textbf{179}}$ | 181 | tie |
+| `i32`, already sorted | 8.9 | 7.9 | ${\color{blue}\Large\textbf{7.6}}$ | tie | 17.9 | ${\color{blue}\Large\textbf{7.2}}$ | 7.8 | tie |
+| `u64`, random | 701 | 572 | ${\color{blue}\Large\textbf{326}}$ | **1.75x** | 394 | 398 | ${\color{blue}\Large\textbf{293}}$ | **1.36x** |
+| `u64`, 64 distinct values | 641 | 274 | ${\color{blue}\Large\textbf{43}}$ | **6.3x** | 187 | 181 | ${\color{blue}\Large\textbf{44}}$ | **4.2x** |
+| `u64`, skewed (90% of the keys in 0..1000) | 682 | ${\color{blue}\Large\textbf{359}}$ | 361 | tie | 278 | ${\color{blue}\Large\textbf{277}}$ | 282 | tie |
+| `{u64 key, u64 row}`, random, by key | 1240 | 1282 | ${\color{blue}\Large\textbf{612}}$ | **2.1x** | 639 | 642 | ${\color{blue}\Large\textbf{527}}$ | **1.22x** |
+| `{u64 key, u64 row}`, 64 distinct keys, by key | 1121 | 694 | ${\color{blue}\Large\textbf{322}}$ | **2.2x** | 344 | 344 | ${\color{blue}\Large\textbf{310}}$ | 1.11x |
 
-The ratio columns compare each radix entry with the comparison entry of the same engine. For the `{key, row}` rows the entries are `sort_by_key` / `sort_by_radix_key` and their stable counterparts.
+The ratio column of each band compares the radix entry with the comparison entry of the same engine. For the `{key, row}` rows the entries are `sort_by_key` / `sort_by_radix_key` and their stable counterparts.
 
 What the table says:
 
@@ -187,13 +187,13 @@ What the table says:
 
 **Text goes through the prefix entries.** A string is longer than 64 bits, so the engine gets its first 8 bytes as a `u64` prefix and the string comparison to break the ties. What makes it pay is computing the prefix once and carrying it next to the reference, as a `(prefix, &str)` pair: almost every comparison is then settled without touching the memory of the string. 5M `&str`, 8 threads, in ms (`vs_rayon prefix`): median of 7 rounds, measured twice like the tables above; the time to build the pairs and to write the sorted references back is inside the measurement:
 
-| 5M `&str` | `par_sort_unstable` | `sort` | `sort_by_prefix_key` | | `par_sort` | `sort_stable` | `sort_stable_by_prefix_key` | |
+| 5M `&str` | `par_sort` | `MM_sort_stable` | `MM_sort_stable_by_prefix_key` | | `par_sort_unstable` | `MM_sort` | `MM_sort_by_prefix_key` | |
 | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| random, 32 hex characters | 920 | 913 | ${\color{blue}\Large\textbf{217}}$ | **4.2x** | 1032 | 707 | 252 | **2.8x** |
-| random, 12 to 27 letters | 1008 | 1004 | ${\color{blue}\Large\textbf{200}}$ | **5.0x** | 982 | 857 | 225 | **3.8x** |
-| random, 64 distinct strings | ${\color{blue}\Large\textbf{137}}$ | 139 | 180 | 0.78x | 252 | 152 | 263 | 0.58x |
-| random, a common 10-byte prefix | 1305 | 1314 | 1468 | 0.89x | 1191 | ${\color{blue}\Large\textbf{1085}}$ | 1175 | 0.92x |
-| already sorted | 161 | 73 | 99 | 0.74x | ${\color{blue}\Large\textbf{72}}$ | 74 | 100 | 0.74x |
+| random, 32 hex characters | 1032 | 707 | ${\color{blue}\Large\textbf{252}}$ | **2.8x** | 920 | 913 | ${\color{blue}\Large\textbf{217}}$ | **4.2x** |
+| random, 12 to 27 letters | 982 | 857 | ${\color{blue}\Large\textbf{225}}$ | **3.8x** | 1008 | 1004 | ${\color{blue}\Large\textbf{200}}$ | **5.0x** |
+| random, 64 distinct strings | 252 | ${\color{blue}\Large\textbf{152}}$ | 263 | 0.58x | ${\color{blue}\Large\textbf{137}}$ | 139 | 180 | 0.78x |
+| random, a common 10-byte prefix | 1191 | ${\color{blue}\Large\textbf{1085}}$ | 1175 | 0.92x | ${\color{blue}\Large\textbf{1305}}$ | 1314 | 1468 | 0.89x |
+| already sorted | ${\color{blue}\Large\textbf{72}}$ | 74 | 100 | 0.74x | 161 | ${\color{blue}\Large\textbf{73}}$ | 99 | 0.74x |
 
 Random text is sorted 4 to 5 times faster than by comparison, and the stable entry gains 2.8x to 3.8x. The entry **loses** wherever the prefix cannot do the work: when the strings are few and repeated, when they all start with the same 8 bytes — every comparison then reads the string anyway, on top of the cost of the pairs — and when the input is already sorted, where building the pairs and writing them back is 26 ms added to a 73 ms job. An engine used on a column of unknown content has a safer form: pass the prefix as a function of the reference, `sort_by_prefix_key(v, |s| prefix(s), |a, b| a.cmp(b))`, with no pairs. In the same measurement it never lost — 1.5x and 1.8x on the two random rows, 1.3x on 64 distinct strings, a tie on the other two.
 
@@ -244,7 +244,9 @@ random in every run, and a control that measures one engine twice to expose the
 noise floor. Like the tables above, it was measured twice and each cell is the
 lower of the two medians; the noise column keeps the larger of the two floors.
 Every output is checked element by element against `std::stable_sort`, index
-included, so a wrong answer cannot be mistaken for a fast one. The engine is built the way
+included, so a wrong answer cannot be mistaken for a fast one. The C++ engine
+has a single, stable sort, so in the two tables below the blue marks the fastest
+time of the whole row. The engine is built the way
 `cargo` builds it — k-way merge and bidirectional leaf merge on — with the
 chaotic fallback pointed at the PSTL; the harness is `src/vs_stable.cpp`.
 
