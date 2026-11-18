@@ -7,9 +7,39 @@
 #include <cmath>
 #include <numeric>
 #include <cstdint>
-#include <omp.h> 
+#include <omp.h>
 #include <memory>
 #include <type_traits>
+#include <bit>
+#include <concepts>
+#include <new>
+#include <utility>
+
+// ============================================================
+// CONFIGURACAO PADRAO
+//
+// O merge de K vias com blocagem de cache e o merge bidirecional nas folhas
+// vem LIGADOS, que e como o build.rs sempre compilou o motor. Antes dependiam
+// de -DMULTIMERGE_KWAY e -DMULTIMERGE_BIDIR, e quem incluisse o cabecalho sem
+// as duas flags -- inclusive o vs_stable.cpp, de onde saia a tabela do README
+// -- media a arvore binaria com merge sequencial nas folhas, que nao e o que o
+// projeto entrega. Medido em 15M de pares {chave, idx}, quase ordenado: 460 ms
+// sem as duas, 262 ms com elas.
+//
+//   -DMULTIMERGE_NO_KWAY    arvore binaria (para comparar)
+//   -DMULTIMERGE_NO_BIDIR   merge sequencial nas folhas (para comparar)
+//   -DKWAY_FANOUT=<k>       fan-out do merge de K vias; potencia de 2, padrao 8
+// ============================================================
+#if defined(MULTIMERGE_NO_KWAY)
+#undef MULTIMERGE_KWAY
+#elif !defined(MULTIMERGE_KWAY)
+#define MULTIMERGE_KWAY
+#endif
+#if defined(MULTIMERGE_NO_BIDIR)
+#undef MULTIMERGE_BIDIR
+#elif !defined(MULTIMERGE_BIDIR)
+#define MULTIMERGE_BIDIR
+#endif
 
 // ============================================================
 // FALLBACK PARA ENTRADA CAOTICA
@@ -400,7 +430,7 @@ inline std::vector<int64_t> junta_metadata(std::vector<std::vector<int64_t>>& pa
             #pragma omp taskwait
         }
 #else
-        // VARIANTE C (padrao): uma unica passada para frente.
+        // SEM o bidirecional (-DMULTIMERGE_NO_BIDIR): uma unica passada para frente.
         // Sem co_rank redundante, sem overhead de task, e sem a caminhada
         // reversa que atrapalha o prefetcher.
         merge_seq(a, b, dest);
@@ -925,22 +955,650 @@ inline std::vector<int64_t> junta_metadata(std::vector<std::vector<int64_t>>& pa
         }
     }
 
-    // ==========================================
-    // MAIN ENTRY POINT
-    // ==========================================
+    // =====================================================================
+    //  FASE 2: NORMALIZACAO DOS RUNS
+    //
+    //  Entre a deteccao e a arvore. Deixa em `arr` so runs ASCENDENTES e
+    //  junta os que ja estao em ordem entre si, para a arvore so receber o
+    //  que precisa mesmo de merge.
+    //
+    //  1. DEVOLVE O PLATO ROUBADO. A varredura de um run ascendente avanca
+    //     enquanto `<=`. Na virada ascendente -> descendente ela leva junto o
+    //     primeiro elemento do dente descendente, que e o MAIOR dele:
+    //
+    //         ... 3 9 | 8 7 6 5 4          o 9 e do dente, nao do run anterior
+    //         ... 3 9 9 | 8 7 6 5 4        com empate no topo, os DOIS 9
+    //
+    //     Com o 9 no run ascendente, ele termina em 9 e o dente, depois de
+    //     invertido, comeca em 4: os dois nao encadeiam e cada par de dentes
+    //     paga um merge. Devolver so um elemento nao basta quando o topo do
+    //     dente tem chaves repetidas -- devolve-se o plato inteiro.
+    //
+    //  2. INVERTE OS DESCENDENTES no lugar, em paralelo. Um run descendente e
+    //     ESTRITO, logo inverter e estavel. O plato devolvido e a excecao: ele
+    //     entra na frente do run com chaves iguais, a inversao troca a ordem
+    //     delas, e uma segunda inversao so do plato a devolve.
+    //
+    //  3. ENCADEIA. Fronteira com `arr[p-1] <= arr[p]` deixa de existir. O
+    //     atalho "ja em ordem" que ficava DENTRO da arvore custava um memcpy
+    //     do trecho por nivel; aqui custa uma comparacao por fronteira. Mil
+    //     dentes em faixas disjuntas viram um segmento so: sem buffer, sem
+    //     merge, sem copia.
+    // =====================================================================
+namespace detail {
+
+#if defined(MULTIMERGE_STATS)
+    /// So para os testes (-DMULTIMERGE_STATS): quantos segmentos ascendentes a
+    /// ultima chamada entregou a arvore. 1 quer dizer que nao houve merge.
+    /// Variavel global sem trava: nao ligue isto em codigo de producao.
+    inline size_t g_segmentos = 0;
+    /// Idem: 1 quando a ultima chamada foi resolvida pela rotina de radix.
+    inline int g_radix = 0;
+#endif
+
+    /// Igualdade na ordem do motor. O motor so pede `<=` e `>` do tipo, e o
+    /// `==` de T pode olhar mais do que a chave (um par {chave, linha}).
     template <typename T>
-    void sort(std::span<T> arr) {
+    inline bool mesma_chave(const T& a, const T& b) { return a <= b && b <= a; }
+
+    /// Passo 1. Ajusta `meta` no lugar. Em `platos` ficam os runs descendentes
+    /// que receberam mais de um elemento: (indice do run, tamanho do plato).
+    template <typename T>
+    void devolve_roubados(std::span<T> arr, std::vector<int64_t>& meta,
+                          std::vector<std::pair<size_t, size_t>>& platos) {
+        size_t off = 0;   // inicio do run i
+        for (size_t i = 0; i + 1 < meta.size(); ++i) {
+            const size_t len = (size_t)std::abs(meta[i]);
+            const size_t head = off + len;            // inicio do run i+1
+            if (meta[i] > 1 && meta[i + 1] < 0) {     // ascendente seguido de descendente
+                const size_t dlen = (size_t)(-meta[i + 1]);
+                const size_t tail = head + dlen;      // fim do run i+1
+                if (!(arr[head - 1] <= arr[head])) {
+                    // Quantos elementos iguais ao maximo ficaram no fim do
+                    // ascendente. O limite deixa ao menos um elemento nele.
+                    size_t k = 1;
+                    while (k < len - 1 && mesma_chave(arr[head - 1 - k], arr[head - 1])) ++k;
+                    // So vale devolver se o que sobra do ascendente encadeia
+                    // com o dente: seu novo ultimo <= o minimo do descendente.
+                    if (arr[head - 1 - k] <= arr[tail - 1]) {
+                        meta[i]     = (int64_t)(len - k);
+                        meta[i + 1] = -(int64_t)(dlen + k);
+                        if (k > 1) platos.emplace_back(i + 1, k);
+                        off += len - k;
+                        continue;
+                    }
+                }
+            }
+            off += len;
+        }
+    }
+
+    /// Passo 2. Runs grandes um de cada vez, com a inversao paralela por
+    /// dentro; os pequenos em paralelo entre si.
+    template <typename T>
+    void inverte_descendentes(std::span<T> arr, const std::vector<int64_t>& meta,
+                              const std::vector<size_t>& off,
+                              const std::vector<std::pair<size_t, size_t>>& platos) {
+        constexpr size_t GRANDE = (size_t)1 << 18;
+        std::vector<size_t> pequenos;
+        for (size_t i = 0; i < meta.size(); ++i) {
+            if (meta[i] >= 0) continue;
+            if (off[i + 1] - off[i] > GRANDE) parallel_reverse(arr.subspan(off[i], off[i + 1] - off[i]));
+            else pequenos.push_back(i);
+        }
+        #pragma omp parallel for schedule(dynamic, 64) if(pequenos.size() > 64)
+        for (long long j = 0; j < (long long)pequenos.size(); ++j) {
+            const size_t i = pequenos[(size_t)j];
+            std::reverse(arr.begin() + off[i], arr.begin() + off[i + 1]);
+        }
+        // O plato devolvido esta agora no FIM do run, com os iguais em ordem
+        // trocada. Inverter so ele devolve a ordem original entre eles.
+        #pragma omp parallel for schedule(dynamic, 64) if(platos.size() > 64)
+        for (long long j = 0; j < (long long)platos.size(); ++j) {
+            const size_t fim = off[platos[(size_t)j].first + 1];
+            std::reverse(arr.begin() + (fim - platos[(size_t)j].second), arr.begin() + fim);
+        }
+    }
+
+    /// Passo 3. Limites dos segmentos ascendentes que sobram depois de juntar
+    /// os runs vizinhos ja em ordem. `off` tem R+1 valores; o resultado, S+1.
+    template <typename T>
+    std::vector<size_t> encadeia(std::span<T> arr, const std::vector<size_t>& off) {
+        std::vector<size_t> seg;
+        seg.push_back(0);
+        for (size_t i = 1; i + 1 < off.size(); ++i) {
+            const size_t p = off[i];
+            if (!(arr[p - 1] <= arr[p])) seg.push_back(p);
+        }
+        seg.push_back(arr.size());
+        return seg;
+    }
+
+}  // namespace detail
+
+    // =====================================================================
+    //  CAMINHO CAOTICO COM CHAVE: RADIX
+    //
+    //  Um sort por comparacao nao passa muito de um quicksort paralelo em dado
+    //  aleatorio. Quem conhece os BITS da chave passa. As entradas
+    //  `sort_radix`, `sort_by_radix_key` e `sort_by_prefix_key` dizem ao motor
+    //  quais sao esses bits; devolvem exatamente o que `sort` devolve, e so o
+    //  caminho do dado caotico muda:
+    //
+    //    1. AMOSTRA: 1024 elementos espalhados. Se um balde dos bits altos
+    //       ficaria com mais de 1/4 deles, a chave e enviesada e a rotina
+    //       desiste antes de varrer o array.
+    //    2. FAIXA: AND e OR de todas as chaves dizem quais bits variam. Chave
+    //       "nua" (o elemento e a chave) com ate 16 bits variando: CONTAGEM,
+    //       histograma e preenchimento paralelos, sem buffer.
+    //    3. HISTOGRAMA dos 8 bits mais altos QUE VARIAM, antes de alocar. Se
+    //       um balde passaria de 1/4 do dado, desiste: nada foi movido.
+    //    4. BUFFER e ESPALHAMENTO paralelo em 256 baldes. Cada pedaco da
+    //       entrada escreve nas suas proprias faixas do destino, calculadas
+    //       do histograma: sem disputa entre threads e na ordem que mantem os
+    //       iguais como vieram.
+    //    5. Cada BALDE dentro do cache, uma tarefa por balde: radix LSD se
+    //       sobram poucos bits, o sort da std se sobram muitos.
+    //    6. Balde grande leva um segundo corte.
+    //
+    //  A rotina devolve `false` SEM TER MOVIDO NADA quando desiste -- chave
+    //  enviesada, balde dominante, falta de memoria -- e o caminho por
+    //  comparacao segue como antes.
+    //
+    //  ESTABILIDADE. O espalhamento percorre os pedacos em ordem, o LSD e
+    //  estavel por construcao, a folha por comparacao e o std::stable_sort, e
+    //  a contagem so existe para chave nua, em que iguais sao indistinguiveis
+    //  (e por isso ali a folha por comparacao pode ser o std::sort).
+    //
+    //  PARALELISMO. Tudo roda como tarefas dentro de UMA regiao paralela: um
+    //  balde que reentra na rotina divide o trabalho com as threads livres,
+    //  em vez de abrir uma regiao aninhada que o OpenMP serializaria.
+    //
+    //  LIMIARES. A estrutura e a do motor Rust; tres limiares NAO sao, porque
+    //  dependem de quem e a alternativa por comparacao, e a do C++ e outra.
+    //  Medido em 2026-11-18, 15M, 8 threads, minimo de 5, duas passadas:
+    //
+    //    folha LSD ate 56 bits (no Rust: 24 e 40). O std::sort e o
+    //      std::stable_sort perdem do LSD em qualquer largura: u64 puro 147 ms
+    //      com LSD ate 56 bits, 250 com LSD so ate 24; linha de 16 bytes com
+    //      chave de 64 bits, 242 contra 530.
+    //    segundo corte em 16 mil elementos (no Rust: 65 mil). Linha de 16
+    //      bytes: 242 ms contra 391 sem o corte; 4 mil empata com 16 mil.
+    //    tamanho minimo: ver `radix_min`.
+    //
+    //  Cada um pode ser trocado na linha de compilacao para medir:
+    //    -DMULTIMERGE_RADIX_MIN=<n>        abaixo disto, so comparacao
+    //    -DMULTIMERGE_RADIX_LSD_BARE=<b>   folha LSD ate b bits, chave nua
+    //    -DMULTIMERGE_RADIX_LSD_ROW=<b>    idem, chave com dado junto
+    //    -DMULTIMERGE_RADIX_RECUT=<n>      balde acima disto leva outro corte
+    // =====================================================================
+#ifndef MULTIMERGE_RADIX_LSD_BARE
+#define MULTIMERGE_RADIX_LSD_BARE 56
+#endif
+#ifndef MULTIMERGE_RADIX_LSD_ROW
+#define MULTIMERGE_RADIX_LSD_ROW 56
+#endif
+#ifndef MULTIMERGE_RADIX_RECUT
+#define MULTIMERGE_RADIX_RECUT 16384
+#endif
+// Os de baixo so mudam nos TESTES, que os poem em miniatura para a rotina
+// reentrar e passar por todas as folhas com poucos milhares de elementos.
+#ifndef MULTIMERGE_RADIX_DIGIT
+#define MULTIMERGE_RADIX_DIGIT 8
+#endif
+#ifndef MULTIMERGE_RADIX_COUNT_BITS
+#define MULTIMERGE_RADIX_COUNT_BITS 16
+#endif
+#ifndef MULTIMERGE_RADIX_PIECE
+#define MULTIMERGE_RADIX_PIECE 65536
+#endif
+#ifndef MULTIMERGE_RADIX_BIG
+#define MULTIMERGE_RADIX_BIG (2u << 20)
+#endif
+#ifndef MULTIMERGE_RADIX_LEAF_MIN
+#define MULTIMERGE_RADIX_LEAF_MIN 128
+#endif
+#ifndef MULTIMERGE_RADIX_SKEW
+#define MULTIMERGE_RADIX_SKEW 4
+#endif
+
+namespace detail {
+
+    constexpr unsigned RADIX_DIGIT      = MULTIMERGE_RADIX_DIGIT;       // bits da passada MSD
+    constexpr unsigned RADIX_COUNT_BITS = MULTIMERGE_RADIX_COUNT_BITS;  // chave nua ate aqui: contagem
+    constexpr unsigned RADIX_LSD_NARROW = 24;       // folha LSD "curta": ate 3 passadas
+    constexpr size_t   RADIX_PIECE      = MULTIMERGE_RADIX_PIECE;       // elementos por pedaco paralelo
+    constexpr size_t   RADIX_BIG        = MULTIMERGE_RADIX_BIG;
+    constexpr size_t   RADIX_BIG_DIV    = 16;       // balde > max(n/16, RADIX_BIG) reentra sempre
+    constexpr size_t   RADIX_RECUT      = MULTIMERGE_RADIX_RECUT;
+    constexpr size_t   RADIX_SKEW       = MULTIMERGE_RADIX_SKEW;        // balde > 1/4 do dado: desiste
+    constexpr size_t   RADIX_LEAF_MIN   = MULTIMERGE_RADIX_LEAF_MIN;    // balde menor: direto ao sort da std
+    constexpr int      RADIX_MAX_DEPTH  = 6;
+    static_assert(RADIX_DIGIT >= 1 && RADIX_DIGIT <= 8, "o espalhamento usa cursores de 256 baldes na pilha");
+
+    /// Abaixo deste tamanho o caminho por comparacao ganha -- e o piso
+    /// depende de QUEM e esse caminho. Medido em 2026-11-18, 8 threads, minimo
+    /// de 40 rodadas alternadas, dado aleatorio:
+    ///
+    ///   fallback interno   o radix ganha de 65 mil em diante (u64 1,28x; i32
+    ///                      1,72x; linha de 16 bytes 1,08x). Em 32 mil ainda
+    ///                      perde na linha de 16 bytes (0,86x).
+    ///   std par (PSTL)     i32 ganha de 131 mil (1,24x). u64 e linha de 16
+    ///                      bytes perdem em 393 mil (0,90x e 0,75x) e ganham
+    ///                      em 524 mil (1,35x e 1,34x).
+    ///   __gnu_parallel     nao medido: vale o piso do PSTL, que e o mais alto.
+    template <typename T>
+    constexpr size_t radix_min() {
+#if defined(MULTIMERGE_RADIX_MIN)
+        return (size_t)(MULTIMERGE_RADIX_MIN);
+#elif defined(MULTIMERGE_PSTL) || defined(MULTIMERGE_USE_GNU_PARALLEL)
+        return sizeof(T) <= 4 ? (size_t)131072 : (size_t)524288;
+#else
+        return (size_t)65536;
+#endif
+    }
+
+    // ---- Como o caminho caotico enxerga a chave de um elemento.
+    //   enabled  ha chave? `NoKey` tira o radix do codigo gerado.
+    //   exact    chaves iguais implicam elementos iguais na ordem. Libera a
+    //            folha LSD. Falso para prefixo: ali o desempate e comparacao.
+    //   bare     o elemento E a chave e se reconstroi dos bits. Libera a
+    //            contagem, e o std::sort como folha.
+    //   lsd_max  folha LSD quando sobram ate estes bits.
+
+    /// Sem chave: so comparacao. E o que `sort` usa.
+    struct NoKey {
+        static constexpr bool enabled = false, exact = false, bare = false;
+        static constexpr unsigned lsd_max = 0;
+    };
+
+    /// O elemento e um inteiro: ele e a chave. Com sinal, inverte-se o bit de
+    /// sinal para a ordem dos bits ser a ordem dos valores.
+    template <typename T>
+    struct BareKey {
+        static constexpr bool enabled = true, exact = true, bare = true;
+        static constexpr unsigned lsd_max = MULTIMERGE_RADIX_LSD_BARE;
+        using U = std::make_unsigned_t<T>;
+        static constexpr U SINAL = std::is_signed_v<T> ? (U)((U)1 << (sizeof(T) * 8 - 1)) : (U)0;
+        uint64_t bits(const T& x) const noexcept { return (uint64_t)(U)((U)x ^ SINAL); }
+        T rebuild(uint64_t b) const noexcept { return (T)(U)((U)b ^ SINAL); }
+    };
+
+    /// A chave extraida decide a ordem inteira; o elemento pode levar dado.
+    template <typename F>
+    struct ExactKey {
+        static constexpr bool enabled = true, exact = true, bare = false;
+        static constexpr unsigned lsd_max = MULTIMERGE_RADIX_LSD_ROW;
+        F f;
+        template <typename T> uint64_t bits(const T& x) const { return (uint64_t)f(x); }
+    };
+
+    /// A chave extraida e so o comeco da ordem; a comparacao desempata.
+    template <typename F>
+    struct PrefixKey {
+        static constexpr bool enabled = true, exact = false, bare = false;
+        static constexpr unsigned lsd_max = 0;
+        F f;
+        template <typename T> uint64_t bits(const T& x) const { return (uint64_t)f(x); }
+    };
+
+    /// A chave e enviesada? Olha 1024 elementos espalhados: se um balde dos
+    /// bits altos fica com mais de 1/RADIX_SKEW da amostra, o espalhamento nao
+    /// dividiria o trabalho.
+    template <typename T, typename Keyer>
+    bool radix_skewed(const T* a, size_t n, const Keyer& key) {
+        const size_t m = std::min<size_t>(1024, n);
+        const size_t step = n / m;
+        uint64_t x_and = ~(uint64_t)0, x_or = 0;
+        for (size_t i = 0; i < m; ++i) {
+            const uint64_t b = key.bits(a[i * step]);
+            x_and &= b; x_or |= b;
+        }
+        const uint64_t diff = x_and ^ x_or;
+        const unsigned hi = diff ? 64u - (unsigned)std::countl_zero(diff) : 0u;
+        if (Keyer::bare && hi <= RADIX_COUNT_BITS) return false;   // candidato a contagem
+        if (hi == 0) return true;                                  // a amostra inteira tem a mesma chave
+        const unsigned b = std::min<unsigned>(RADIX_DIGIT, hi);
+        const unsigned shift = hi - b;
+        const uint64_t mask = ((uint64_t)1 << b) - 1;
+        size_t h[256] = {};
+        for (size_t i = 0; i < m; ++i) ++h[(key.bits(a[i * step]) >> shift) & mask];
+        for (size_t d = 0; d <= mask; ++d)
+            if (h[d] * RADIX_SKEW > m) return true;
+        return false;
+    }
+
+    /// AND e OR de todas as chaves: os bits em que diferem sao os que variam.
+    template <typename T, typename Keyer>
+    void radix_range(const T* a, size_t n, const Keyer& key, uint64_t& out_and, uint64_t& out_or) {
+        const size_t pieces = std::clamp<size_t>(n >> 16, 1, 256);
+        const size_t chunk = (n + pieces - 1) / pieces;
+        std::vector<uint64_t> pa(pieces, ~(uint64_t)0), po(pieces, 0);
+        #pragma omp taskloop grainsize(1) default(shared) if(pieces > 1)
+        for (long long q = 0; q < (long long)pieces; ++q) {
+            const size_t s = (size_t)q * chunk, e = std::min(s + chunk, n);
+            uint64_t x_and = ~(uint64_t)0, x_or = 0;
+            for (size_t i = s; i < e; ++i) {
+                const uint64_t b = key.bits(a[i]);
+                x_and &= b; x_or |= b;
+            }
+            pa[(size_t)q] = x_and; po[(size_t)q] = x_or;
+        }
+        out_and = ~(uint64_t)0; out_or = 0;
+        for (size_t q = 0; q < pieces; ++q) { out_and &= pa[q]; out_or |= po[q]; }
+    }
+
+    /// Chave nua de faixa pequena: conta e preenche, sem buffer. `x_or` e o OU
+    /// de todas as chaves e `hi` quantos bits de baixo variam.
+    template <typename T, typename Keyer>
+    void radix_count(T* a, size_t n, const Keyer& key, uint64_t x_or, unsigned hi) {
+        const size_t nb = (size_t)1 << hi;
+        const uint64_t low = (uint64_t)nb - 1;
+        const uint64_t base = x_or & ~low;   // os bits de cima sao iguais em todas as chaves
+        const size_t pieces = std::clamp<size_t>(n >> 20, 1, 16);
+        const size_t chunk = (n + pieces - 1) / pieces;
+        std::vector<size_t> h(pieces * nb, 0);
+        #pragma omp taskloop grainsize(1) default(shared) if(pieces > 1)
+        for (long long q = 0; q < (long long)pieces; ++q) {
+            size_t* hq = h.data() + (size_t)q * nb;
+            const size_t s = (size_t)q * chunk, e = std::min(s + chunk, n);
+            for (size_t i = s; i < e; ++i) ++hq[key.bits(a[i]) & low];
+        }
+        std::vector<size_t> ini(nb + 1, 0);   // onde cada valor comeca na saida
+        for (size_t d = 0; d < nb; ++d) {
+            size_t c = 0;
+            for (size_t q = 0; q < pieces; ++q) c += h[q * nb + d];
+            ini[d + 1] = ini[d] + c;
+        }
+        // Cada pedaco da SAIDA e preenchido por uma tarefa, comecando no valor
+        // que cai no seu inicio: equilibrado mesmo com um valor dominante.
+        #pragma omp taskloop grainsize(1) default(shared) if(pieces > 1)
+        for (long long q = 0; q < (long long)pieces; ++q) {
+            size_t s = (size_t)q * chunk;
+            const size_t e = std::min(s + chunk, n);
+            size_t d = (size_t)(std::upper_bound(ini.begin(), ini.end(), s) - ini.begin()) - 1;
+            while (s < e) {
+                const size_t fim = std::min(ini[d + 1], e);
+                std::fill(a + s, a + fim, key.rebuild(base | (uint64_t)d));
+                s = fim; ++d;
+            }
+        }
+    }
+
+    /// Histograma da passada MSD de um trecho.
+    struct RadixPlan {
+        unsigned shift = 0;          // bits abaixo do digito: o que sobra para a folha
+        uint64_t mask = 0;
+        size_t nb = 0, chunk = 0, pieces = 0;
+        std::vector<size_t> hist;    // pieces x nb; o espalhamento o transforma em cursores
+        std::vector<size_t> bounds;  // limites dos baldes no destino (nb + 1)
+    };
+
+    /// Conta o digito MSD: os RADIX_DIGIT bits mais altos entre os `hi` que
+    /// variam. Falso se um balde ficaria com mais de 1/RADIX_SKEW do trecho.
+    template <typename T, typename Keyer>
+    bool radix_plan(const T* a, size_t n, const Keyer& key, unsigned hi, RadixPlan& p) {
+        const unsigned b = std::min<unsigned>(RADIX_DIGIT, hi);
+        p.shift = hi - b;
+        p.nb = (size_t)1 << b;
+        p.mask = (uint64_t)p.nb - 1;
+        p.pieces = std::clamp<size_t>(n / RADIX_PIECE, 1, 128);
+        p.chunk = (n + p.pieces - 1) / p.pieces;
+        p.hist.assign(p.pieces * p.nb, 0);
+        const unsigned shift = p.shift;
+        const uint64_t mask = p.mask;
+        const size_t nb = p.nb, chunk = p.chunk, pieces = p.pieces;
+        size_t* hist = p.hist.data();
+        #pragma omp taskloop grainsize(1) default(shared) if(pieces > 1)
+        for (long long q = 0; q < (long long)pieces; ++q) {
+            size_t* h = hist + (size_t)q * nb;
+            const size_t s = (size_t)q * chunk, e = std::min(s + chunk, n);
+            for (size_t i = s; i < e; ++i) ++h[(key.bits(a[i]) >> shift) & mask];
+        }
+        p.bounds.assign(nb + 1, 0);
+        for (size_t d = 0; d < nb; ++d) {
+            size_t c = 0;
+            for (size_t q = 0; q < pieces; ++q) c += hist[q * nb + d];
+            p.bounds[d + 1] = p.bounds[d] + c;
+        }
+        const size_t limite = n / RADIX_SKEW;
+        for (size_t d = 0; d < nb; ++d)
+            if (p.bounds[d + 1] - p.bounds[d] > limite) return false;
+        return true;
+    }
+
+    /// Espalha `src` em `dst` conforme o plano, em paralelo. Para cada balde,
+    /// e dentro dele para cada pedaco, o histograma da a faixa exata do
+    /// destino: o pedaco q escreve o balde d a partir de
+    /// bounds[d] + (o que os pedacos anteriores tem do balde d).
+    template <typename T, typename Keyer>
+    void radix_scatter(const T* src, T* dst, size_t n, RadixPlan& p, const Keyer& key) {
+        const size_t nb = p.nb, chunk = p.chunk, pieces = p.pieces;
+        const unsigned shift = p.shift;
+        const uint64_t mask = p.mask;
+        size_t* hist = p.hist.data();
+        for (size_t d = 0; d < nb; ++d) {
+            size_t acc = p.bounds[d];
+            for (size_t q = 0; q < pieces; ++q) {
+                const size_t c = hist[q * nb + d];
+                hist[q * nb + d] = acc;
+                acc += c;
+            }
+        }
+        #pragma omp taskloop grainsize(1) default(shared) if(pieces > 1)
+        for (long long q = 0; q < (long long)pieces; ++q) {
+            size_t cur[256];   // copia local: sem falso compartilhamento entre pedacos
+            std::copy(hist + (size_t)q * nb, hist + (size_t)q * nb + nb, cur);
+            const size_t s = (size_t)q * chunk, e = std::min(s + chunk, n);
+            for (size_t i = s; i < e; ++i) {
+                const T x = src[i];
+                dst[cur[(key.bits(x) >> shift) & mask]++] = x;
+            }
+        }
+    }
+
+    /// Radix LSD sequencial de um balde, sobre os `low_bits` de baixo da chave
+    /// (os de cima sao iguais no balde inteiro). O dado esta em `src`; o
+    /// resultado termina em `dst`. Os histogramas de todas as passadas saem de
+    /// UMA leitura; passada de digito constante e pulada.
+    template <typename T, typename Keyer>
+    void radix_lsd(T* src, T* dst, size_t n, const Keyer& key, unsigned low_bits) {
+        const unsigned passes = (low_bits + 7) / 8;   // <= 8
+        size_t h[8][256] = {};
+        for (size_t i = 0; i < n; ++i) {
+            const uint64_t b = key.bits(src[i]);
+            for (unsigned p = 0; p < passes; ++p) ++h[p][(b >> (8 * p)) & 0xFF];
+        }
+        T* a = src;
+        T* b = dst;
+        for (unsigned p = 0; p < passes; ++p) {
+            size_t* hp = h[p];
+            bool constante = false;
+            size_t acc = 0;
+            for (unsigned d = 0; d < 256; ++d) {
+                const size_t c = hp[d];
+                if (c == n) constante = true;
+                hp[d] = acc;
+                acc += c;
+            }
+            if (constante) continue;
+            const unsigned sh = 8 * p;
+            for (size_t i = 0; i < n; ++i) {
+                const T x = a[i];
+                b[hp[(key.bits(x) >> sh) & 0xFF]++] = x;
+            }
+            std::swap(a, b);
+        }
+        if (a != dst) std::copy(a, a + n, dst);
+    }
+
+    /// Folha por comparacao. Com chave nua, iguais sao indistinguiveis e o
+    /// std::sort (que nao aloca) serve; fora disso, o estavel.
+    template <typename T, typename Keyer>
+    inline void radix_leaf_sort(T* a, size_t n) {
+        if constexpr (Keyer::bare) std::sort(a, a + n);
+        else std::stable_sort(a, a + n);
+    }
+
+    /// Sort por comparacao de um trecho GRANDE em que o radix nao serve
+    /// (prefixo que nao distingue, balde que continua enviesado). Blocos em
+    /// tarefas e a arvore de merge do motor; roda dentro da regiao paralela.
+    template <typename T, typename Keyer>
+    void radix_fallback(T* a, size_t n) {
+        constexpr size_t BLOCO = 65536;
+        if (n <= 2 * BLOCO) { radix_leaf_sort<T, Keyer>(a, n); return; }
+        std::unique_ptr<T[]> buf(new (std::nothrow) T[n]);
+        if (!buf) { radix_leaf_sort<T, Keyer>(a, n); return; }
+        const size_t blocos = (n + BLOCO - 1) / BLOCO;
+        #pragma omp taskloop grainsize(1) default(shared)
+        for (long long i = 0; i < (long long)blocos; ++i) {
+            const size_t s = (size_t)i * BLOCO, e = std::min(s + BLOCO, n);
+            radix_leaf_sort<T, Keyer>(a + s, e - s);
+        }
+        std::vector<int64_t> meta(blocos);
+        for (size_t i = 0; i < blocos; ++i)
+            meta[i] = (int64_t)(std::min((i + 1) * BLOCO, n) - i * BLOCO);
+        const std::vector<size_t> off = block_offsets(meta);
+        bottom_up_merge<T>(std::span<T>(a, n), std::span<T>(buf.get(), n),
+                           std::span<const int64_t>(meta), std::span<const size_t>(off),
+                           get_leaf_size<T>(), false);
+    }
+
+    template <typename T, typename Keyer>
+    void radix_bucket(T* a, T* s, size_t n, const Keyer& key, int depth);
+
+    /// Ordena cada balde. O dado esta em `buf`; o resultado termina em `arr`.
+    template <typename T, typename Keyer>
+    void radix_buckets(T* arr, T* buf, size_t n, const RadixPlan& p, const Keyer& key, int depth) {
+        const size_t big = std::max<size_t>(n / RADIX_BIG_DIV, RADIX_BIG);
+        const unsigned shift = p.shift;
+        // Folha estreita = LSD de poucas passadas: ali so reentra o balde
+        // grande de verdade. Folha larga (muitas passadas, ou comparacao): um
+        // segundo corte MSD sai mais barato que ordenar um balde que nao cabe
+        // no cache.
+        const bool narrow = Keyer::exact && shift <= RADIX_LSD_NARROW;
+        const size_t recut = narrow ? big : std::min<size_t>(RADIX_RECUT, big);
+        for (size_t d = 0; d < p.nb; ++d) {
+            const size_t lo = p.bounds[d];
+            const size_t len = p.bounds[d + 1] - lo;
+            if (len == 0) continue;
+            T* a = arr + lo;
+            T* s = buf + lo;
+            #pragma omp task firstprivate(a, s, len, shift, recut, big, depth) shared(key) if(len > 2048)
+            {
+                if (Keyer::exact && shift == 0) {
+                    // O digito cobriu todos os bits que variam: chaves identicas.
+                    std::copy(s, s + len, a);
+                } else if (len > recut && depth < RADIX_MAX_DEPTH) {
+                    // De volta para `arr` e a rotina de novo, com o proprio
+                    // pedaco do buffer como rascunho.
+                    std::copy(s, s + len, a);
+                    radix_bucket(a, s, len, key, depth + 1);
+                } else if (Keyer::exact && len >= RADIX_LEAF_MIN && shift <= Keyer::lsd_max) {
+                    radix_lsd(s, a, len, key, shift);
+                } else {
+                    std::copy(s, s + len, a);
+                    if (len > big) radix_fallback<T, Keyer>(a, len);
+                    else radix_leaf_sort<T, Keyer>(a, len);
+                }
+            }
+        }
+        #pragma omp taskwait
+    }
+
+    /// A rotina de novo em um balde grande. O dado esta em `a`; `s` e rascunho.
+    template <typename T, typename Keyer>
+    void radix_bucket(T* a, T* s, size_t n, const Keyer& key, int depth) {
+        uint64_t x_and, x_or;
+        radix_range(a, n, key, x_and, x_or);
+        const uint64_t diff = x_and ^ x_or;
+        if (diff == 0) {
+            if (!Keyer::exact) radix_fallback<T, Keyer>(a, n);
+            return;
+        }
+        const unsigned hi = 64u - (unsigned)std::countl_zero(diff);
+        if constexpr (Keyer::bare) {
+            if (hi <= RADIX_COUNT_BITS) { radix_count(a, n, key, x_or, hi); return; }
+        }
+        RadixPlan p;
+        if (radix_plan(a, n, key, hi, p)) {
+            radix_scatter(a, s, n, p, key);
+            radix_buckets(a, s, n, p, key, depth);
+        } else {
+            radix_fallback<T, Keyer>(a, n);
+        }
+    }
+
+    /// Ordena `arr` por radix. Devolve `false`, sem ter movido nenhum
+    /// elemento, quando a chave e enviesada, quando o prefixo nao distingue
+    /// nada ou quando nao ha memoria para o buffer.
+    template <typename T, typename Keyer>
+    bool radix_sort(std::span<T> arr, const Keyer& key) {
+        static_assert(std::is_trivially_copyable_v<T>,
+                      "as entradas com radix pedem um tipo trivialmente copiavel");
+        T* const a = arr.data();
+        const size_t n = arr.size();
+        if (n < 2) return true;
+        if (radix_skewed(a, n, key)) return false;
+
+        bool feito = false;
+        #pragma omp parallel
+        #pragma omp single
+        {
+            feito = [&]() -> bool {
+                uint64_t x_and, x_or;
+                radix_range(a, n, key, x_and, x_or);
+                const uint64_t diff = x_and ^ x_or;
+                // Todas as chaves iguais. Com chave exata nao ha o que ordenar;
+                // com prefixo, ele nao distingue nada e a comparacao assume.
+                if (diff == 0) return Keyer::exact;
+                const unsigned hi = 64u - (unsigned)std::countl_zero(diff);
+                if constexpr (Keyer::bare) {
+                    if (hi <= RADIX_COUNT_BITS) { radix_count(a, n, key, x_or, hi); return true; }
+                }
+                // O histograma vem ANTES do buffer: se a chave for enviesada,
+                // desistir nao custou nem a alocacao.
+                RadixPlan p;
+                if (!radix_plan(a, n, key, hi, p)) return false;
+                std::unique_ptr<T[]> buf(new (std::nothrow) T[n]);
+                if (!buf) return false;
+                radix_scatter(a, buf.get(), n, p, key);
+                radix_buckets(a, buf.get(), n, p, key, 0);
+                return true;
+            }();
+        }
+        return feito;
+    }
+
+    // ==========================================
+    // ENTRADA COMUM
+    // ==========================================
+    template <typename T, typename Keyer>
+    void sort_with_key(std::span<T> arr, const Keyer& key) {
         size_t n = arr.size();
         size_t leaf_size = get_leaf_size<T>();
+#if defined(MULTIMERGE_STATS)
+        g_segmentos = 0;
+        g_radix = 0;
+#endif
 
         if (n <= leaf_size) {
-            std::stable_sort(arr.begin(), arr.end()); 
+            std::stable_sort(arr.begin(), arr.end());
             return;
         }
 
         // Failsafe for complete chaos (random sequences).
-        // Ver a nota no topo do arquivo: a ordem de preferencia foi medida.
         if (evaluate_local_entropy(arr)) {
+            // RADIX: so com chave conhecida. Se a rotina desistir, nada foi
+            // movido e o caminho por comparacao abaixo segue igual.
+            if constexpr (Keyer::enabled) {
+                const bool feito = n >= radix_min<T>() && radix_sort(arr, key);
+#if defined(MULTIMERGE_STATS)
+                g_radix = feito ? 1 : 0;
+#endif
+                if (feito) return;
+            }
+            // Ver a nota no topo do arquivo: a ordem de preferencia foi medida.
 #if defined(MULTIMERGE_PSTL)
             std::stable_sort(std::execution::par, arr.begin(), arr.end());
 #elif defined(MULTIMERGE_USE_GNU_PARALLEL)
@@ -959,12 +1617,26 @@ inline std::vector<int64_t> junta_metadata(std::vector<std::vector<int64_t>>& pa
             return;
         }
 
+        // FASE 2: so sobram runs ascendentes, e os que ja estao em ordem
+        // entre si viram um segmento.
+        std::vector<std::pair<size_t, size_t>> platos;
+        devolve_roubados(arr, metadata, platos);
         std::vector<size_t> offsets = block_offsets(metadata);
+        inverte_descendentes(arr, metadata, offsets, platos);
+        offsets = encadeia(arr, offsets);
+#if defined(MULTIMERGE_STATS)
+        g_segmentos = offsets.size() - 1;
+#endif
+        if (offsets.size() == 2) return;   // um segmento: ja esta ordenado
+
+        metadata.resize(offsets.size() - 1);
+        for (size_t i = 0; i + 1 < offsets.size(); ++i)
+            metadata[i] = (int64_t)(offsets[i + 1] - offsets[i]);
 
         // Zero-initialization elision: Memory allocated without being cleared
         auto buffer_ptr = std::make_unique_for_overwrite<T[]>(n);
         std::span<T> buffer(buffer_ptr.get(), n);
-        
+
         // Bootstraps the OpenMP Thread Pool exactly once
         #pragma omp parallel
         {
@@ -977,6 +1649,46 @@ inline std::vector<int64_t> junta_metadata(std::vector<std::vector<int64_t>>& pa
 #endif
             }
         }
+    }
+
+}  // namespace detail
+
+    // ==========================================
+    // MAIN ENTRY POINT
+    // ==========================================
+
+    /// Ordenacao estavel. O tipo precisa de `<`, `<=`, `>` e `>=`.
+    template <typename T>
+    void sort(std::span<T> arr) {
+        detail::sort_with_key(arr, detail::NoKey{});
+    }
+
+    /// `sort` para inteiros. Mesmo resultado; o dado caotico vai por radix.
+    /// Esse caminho aloca um buffer de n elementos, salvo quando as chaves
+    /// cabem em 16 bits (contagem). Sem memoria, ou com chave enviesada
+    /// demais para o radix render, o caminho por comparacao assume.
+    template <typename T>
+        requires std::integral<T> && (!std::same_as<T, bool>)
+    void sort_radix(std::span<T> arr) {
+        detail::sort_with_key(arr, detail::BareKey<T>{});
+    }
+
+    /// `sort` quando uma chave de ate 64 bits decide a ordem inteira:
+    /// `key(a) < key(b)` exatamente quando `a < b`, e chaves iguais quando
+    /// nenhum dos dois vem antes. O elemento pode levar dado junto (um par
+    /// {chave, linha}); a ordem entre chaves iguais e preservada.
+    template <typename T, typename KeyFn>
+    void sort_by_radix_key(std::span<T> arr, KeyFn key) {
+        detail::sort_with_key(arr, detail::ExactKey<KeyFn>{std::move(key)});
+    }
+
+    /// `sort` quando a chave e maior que 64 bits, como texto. `prefix` da o
+    /// comeco da ordem -- `prefix(a) < prefix(b)` implica `a < b` -- e os
+    /// operadores de T desempatam. Para texto: os 8 primeiros bytes, em
+    /// big-endian.
+    template <typename T, typename PrefixFn>
+    void sort_by_prefix_key(std::span<T> arr, PrefixFn prefix) {
+        detail::sort_with_key(arr, detail::PrefixKey<PrefixFn>{std::move(prefix)});
     }
 }
 

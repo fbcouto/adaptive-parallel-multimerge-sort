@@ -17,6 +17,8 @@ fn main() {
     println!("cargo:rerun-if-env-changed=MULTIMERGE_PSTL");
     println!("cargo:rerun-if-env-changed=MULTIMERGE_TBB_LIB");
     println!("cargo:rerun-if-env-changed=MULTIMERGE_NATIVE");
+    println!("cargo:rerun-if-env-changed=MULTIMERGE_LIB_DIR");
+    println!("cargo:rerun-if-env-changed=CXX");
 
     let mut build = cc::Build::new();
     build.cpp(true);
@@ -42,6 +44,30 @@ fn main() {
         .flag("-std=c++20")
         .flag("-O3")
         .flag("-fopenmp");
+
+    // Where libtbb12 / libgomp live. cc-rs hands the toolchain defaults to the
+    // COMPILER, but rustc performs the final link and knows nothing about the
+    // MSYS2 prefix -- without this the build dies on "cannot find -ltbb12".
+    // Derived from the compiler path (<prefix>/bin/g++ -> <prefix>/lib);
+    // override with MULTIMERGE_LIB_DIR when the layout differs.
+    //
+    // This matters more than it looks: on MSYS2 only the UCRT64 prefix has a
+    // libstdc++ that actually engages the parallel policies. Measured with a
+    // 5M random probe, std::execution::par against the sequential stable_sort:
+    // UCRT64 3.62x, MINGW64 0.95x. Pointing this at the wrong prefix produces a
+    // binary that links, runs, and silently benchmarks a serial sort.
+    let lib_dir = std::env::var("MULTIMERGE_LIB_DIR").ok().or_else(|| {
+        compiler
+            .path()
+            .parent()
+            .and_then(|bin| bin.parent())
+            .map(|root| root.join("lib"))
+            .filter(|d| d.is_dir())
+            .map(|d| d.display().to_string())
+    });
+    if let Some(d) = &lib_dir {
+        println!("cargo:rustc-link-search=native={d}");
+    }
 
     // Fallback engine for high-entropy data. OFF by default: the internal
     // chunk_parallel_sort beat __gnu_parallel::stable_sort in 30 of 36 measured
@@ -120,6 +146,11 @@ fn main() {
                 build.define("KWAY_FANOUT", k.to_string().as_str());
             }
         }
+    } else {
+        // The header now turns the k-way merge on by itself, so that including
+        // it without flags gives the engine this build ships. Switching it off
+        // has to be said explicitly.
+        build.define("MULTIMERGE_NO_KWAY", None);
     }
 
     // Bidirectional leaf merge (merge_front + merge_back running as two tasks).
@@ -129,7 +160,11 @@ fn main() {
     // spawns. Disable for A/B benchmarking with MULTIMERGE_BIDIR=0.
     let bidir = std::env::var("MULTIMERGE_BIDIR")
         .map(|v| !v.is_empty() && v != "0").unwrap_or(true);
-    if bidir { build.define("MULTIMERGE_BIDIR", None); }
+    if bidir {
+        build.define("MULTIMERGE_BIDIR", None);
+    } else {
+        build.define("MULTIMERGE_NO_BIDIR", None); // same reason as MULTIMERGE_NO_KWAY
+    }
 
     // -march=native is opt-in because it makes the binary non-portable.
     // Measurements showed this workload is memory-bandwidth bound, so do not

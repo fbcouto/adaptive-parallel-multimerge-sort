@@ -10,13 +10,28 @@
 //   vs gnu   = ganho contra um sort estavel PARALELO, mesmo numero de threads
 //              (esta e a comparacao honesta do algoritmo)
 //
-// Compilar com a referencia paralela:
-//   g++ -std=c++20 -O3 -fopenmp -DMULTIMERGE_USE_GNU_PARALLEL vs_stable.cpp -o vs_stable
+// Compilar (UCRT64 do MSYS2, que e onde o `par` do C++17 engata):
+//   g++ -std=c++20 -O3 -fopenmp -DMULTIMERGE_PSTL -DMULTIMERGE_TEST_PAR vs_stable.cpp -ltbb12 -o vs_stable
+//
+// O cabecalho ja liga o merge de K vias e o merge bidirecional, que e como o
+// cargo compila o motor. (Ate 2026-11-18 era preciso pedir os dois por flag, e
+// a tabela do README saiu durante meses de um binario sem eles: media a arvore
+// binaria.) MULTIMERGE_PSTL manda o caminho caotico para o `par`; sem ele vale
+// o chunk_parallel_sort interno. Para acrescentar a referencia __gnu_parallel:
+// -DMULTIMERGE_USE_GNU_PARALLEL (que tambem TROCA o fallback do motor quando o
+// PSTL nao esta ligado).
 //
 // DISCIPLINA. Uma medicao unica nao vale nada nesta carga: ja vimos 15 a 50%
 // de variacao entre execucoes identicas. Aqui ha mediana de N repeticoes,
-// ordem rotativa entre motores, buffer reutilizado, e uma LINHA DE CONTROLE
-// que mede o mesmo motor duas vezes para expor o piso de ruido.
+// ordem dos motores SORTEADA a cada rodada, buffer reutilizado, e uma LINHA DE
+// CONTROLE que mede o mesmo motor duas vezes para expor o piso de ruido.
+//
+// A ordem e sorteada (semente fixa), nao girada: na rotacao ciclica cada motor
+// roda sempre atras do mesmo vizinho, e em cenarios de poucos milissegundos
+// isso fez sort_by_radix_key parecer 1 a 2 ms mais lento que sort no dado ja
+// ordenado, onde os dois executam o mesmo codigo (medido em 2026-11-18).
+//
+//   vs_stable [n] [repeticoes]        padrao: 5000000 9
 
 #include "MultiMergeSort.hpp"
 #include <vector>
@@ -44,7 +59,7 @@
 #endif
 
 using clk = std::chrono::high_resolution_clock;
-static const int REPS = 9;
+static int REPS = 9;
 
 struct Keyed {
     uint64_t key;
@@ -70,7 +85,7 @@ static double mediana(std::vector<double> v) {
     return v[v.size() / 2];
 }
 
-enum Motor { STD, PAR, GNU, MULTI, GNU_CTRL };
+enum Motor { STD, PAR, GNU, MULTI, MULTI_CTRL, MULTI_RADIX, GNU_CTRL };
 
 static const char* nome_motor(Motor m) {
     switch (m) {
@@ -78,6 +93,8 @@ static const char* nome_motor(Motor m) {
         case PAR:      return "std::stable_sort(par) C++17";
         case GNU:      return "__gnu_parallel::stable_sort";
         case GNU_CTRL: return "  ^ CONTROLE (mesmo motor)";
+        case MULTI_CTRL:  return "  ^ CONTROLE (mesmo motor)";
+        case MULTI_RADIX: return "multimerge::sort_by_radix_key";
         default:       return "multimerge::sort";
     }
 }
@@ -99,12 +116,20 @@ static void aplica(Motor m, std::vector<Keyed>& v) {
             std::stable_sort(v.begin(), v.end());
 #endif
             break;
+        case MULTI_RADIX:
+            // Mesma saida de multimerge::sort; o dado caotico vai por radix.
+            multimerge::sort_by_radix_key(std::span<Keyed>(v), [](const Keyed& k) { return k.key; });
+            break;
         default: multimerge::sort(std::span<Keyed>(v)); break;
     }
 }
 
 /// Gera `n` elementos. `card` = numero de chaves distintas.
-/// `forma`: 0 aleatorio, 1 dente de serra, 2 quase ordenado, 3 ordenado, 4 invertido
+/// `forma`: 0 aleatorio, 1 dente de serra, 2 quase ordenado, 3 ordenado, 4 invertido,
+///          5 dentes em faixas disjuntas (ordenado, com cada bloco impar invertido;
+///            1000 dentes -- o "Sawtooth" dos benchmarks Java e Python),
+///          6 o mesmo, com UMA chave repetida no topo de um dente descendente
+/// `card` = 0 no aleatorio quer dizer a faixa inteira de 64 bits.
 static std::vector<Keyed> gera(size_t n, uint64_t card, int forma, std::mt19937_64& rng) {
     std::vector<Keyed> v(n);
     switch (forma) {
@@ -115,7 +140,19 @@ static std::vector<Keyed> gera(size_t n, uint64_t card, int forma, std::mt19937_
             break;
         case 3: for (size_t i = 0; i < n; ++i) v[i].key = (uint64_t)i; break;
         case 4: for (size_t i = 0; i < n; ++i) v[i].key = (uint64_t)(n - i); break;
-        default: for (auto& e : v) e.key = rng() % card; break;
+        case 5: case 6: {
+            const size_t dente = std::max<size_t>(n / 1000, 2);
+            for (size_t i = 0; i < n; ++i) {
+                const size_t d = i / dente;
+                const size_t len = std::min(dente, n - d * dente);
+                size_t k = i % dente;
+                if (d % 2 == 1) k = len - 1 - k;
+                v[i].key = (uint64_t)(d * dente + k);
+            }
+            if (forma == 6 && n > 502 * dente + 1) v[501 * dente + 1].key = v[501 * dente].key;
+            break;
+        }
+        default: for (auto& e : v) e.key = card ? rng() % card : rng(); break;
     }
     for (size_t i = 0; i < n; ++i) v[i].idx = i;
     return v;
@@ -127,12 +164,12 @@ static void roda(const std::string& nome, const std::vector<Keyed>& base) {
     std::vector<Keyed> ref = base;
     std::stable_sort(ref.begin(), ref.end());
 
-    std::vector<Motor> motores = {STD, MULTI};
+    std::vector<Motor> motores = {STD, MULTI, MULTI_CTRL, MULTI_RADIX};
 #if defined(MULTIMERGE_TEST_PAR)
     motores.insert(motores.begin() + 1, PAR);
 #endif
 #if defined(MULTIMERGE_USE_GNU_PARALLEL)
-    motores.insert(motores.end() - 1, GNU);
+    motores.push_back(GNU);
     motores.push_back(GNU_CTRL);
 #endif
 
@@ -146,9 +183,14 @@ static void roda(const std::string& nome, const std::vector<Keyed>& base) {
         aplica(motores[i], v);
     }
 
+    std::vector<size_t> ordem(motores.size());
+    for (size_t i = 0; i < ordem.size(); ++i) ordem[i] = i;
+    std::mt19937 sorteio(0x0DE5u + (unsigned)n);
+
     for (int rep = 0; rep < REPS; ++rep) {
+        std::shuffle(ordem.begin(), ordem.end(), sorteio);
         for (size_t slot = 0; slot < motores.size(); ++slot) {
-            size_t id = (rep + slot) % motores.size();
+            size_t id = ordem[slot];
             std::copy(base.begin(), base.end(), v.begin());   // fora do cronometro
             auto t0 = clk::now();
             aplica(motores[id], v);
@@ -162,12 +204,15 @@ static void roda(const std::string& nome, const std::vector<Keyed>& base) {
     for (size_t i = 0; i < motores.size(); ++i) med[i] = mediana(t[i]);
 
     size_t i_std = 0, i_gnu = (size_t)-1, i_multi = 0, i_ctrl = (size_t)-1, i_par = (size_t)-1;
+    size_t i_mctrl = (size_t)-1, i_radix = (size_t)-1;
     for (size_t i = 0; i < motores.size(); ++i) {
-        if (motores[i] == STD)      i_std = i;
-        if (motores[i] == PAR)      i_par = i;
-        if (motores[i] == GNU)      i_gnu = i;
-        if (motores[i] == MULTI)    i_multi = i;
-        if (motores[i] == GNU_CTRL) i_ctrl = i;
+        if (motores[i] == STD)         i_std = i;
+        if (motores[i] == PAR)         i_par = i;
+        if (motores[i] == GNU)         i_gnu = i;
+        if (motores[i] == MULTI)       i_multi = i;
+        if (motores[i] == GNU_CTRL)    i_ctrl = i;
+        if (motores[i] == MULTI_CTRL)  i_mctrl = i;
+        if (motores[i] == MULTI_RADIX) i_radix = i;
     }
 
     printf("\n=== %s ===  n=%zu  threads=%d\n", nome.c_str(), n, omp_get_max_threads());
@@ -196,7 +241,19 @@ static void roda(const std::string& nome, const std::vector<Keyed>& base) {
         }
         printf("\n");
     }
-    if (i_ctrl != (size_t)-1) {
+    if (i_par != (size_t)-1) {
+        printf("  multimerge::sort contra o par: %.2fx", med[i_par] / med[i_multi]);
+        if (i_radix != (size_t)-1) printf("   |   com chave radix: %.2fx", med[i_par] / med[i_radix]);
+        printf("\n");
+    }
+    if (i_mctrl != (size_t)-1) {
+        // O mesmo motor medido duas vezes em cada rodada: a diferenca entre
+        // as duas medianas e o piso de ruido desta tabela.
+        double ruido = 100.0 * std::abs(med[i_mctrl] - med[i_multi]) / med[i_multi];
+        printf("  PISO DE RUIDO: %.1f%%", ruido);
+        if (ruido > 10.0) printf("   <- ALTO: diferencas menores que isto nao sao legiveis");
+        printf("\n");
+    } else if (i_ctrl != (size_t)-1) {
         double ruido = 100.0 * std::abs(med[i_ctrl] - med[i_gnu]) / med[i_gnu];
         printf("  PISO DE RUIDO: %.1f%%", ruido);
         if (ruido > 10.0) printf("   <- ALTO: diferencas menores que isto nao sao legiveis");
@@ -206,9 +263,10 @@ static void roda(const std::string& nome, const std::vector<Keyed>& base) {
 
 int main(int argc, char** argv) {
     size_t n = (argc > 1) ? std::stoull(argv[1]) : 5'000'000;
+    if (argc > 2) REPS = std::max(1, std::stoi(argv[2]));
 
     printf("multimerge::sort CONTRA OS SORTS ESTAVEIS DA STD\n");
-    printf("%d threads OpenMP | mediana de %d, ordem rotativa, aquecimento descartado\n",
+    printf("%d threads OpenMP | mediana de %d, ordem sorteada a cada rodada, aquecimento descartado\n",
            omp_get_max_threads(), REPS);
 #if defined(MULTIMERGE_USE_GNU_PARALLEL)
     printf("referencia paralela: __gnu_parallel::stable_sort DISPONIVEL\n");
@@ -221,16 +279,20 @@ int main(int argc, char** argv) {
     printf("Estavel = chaves iguais mantem a ordem original de idx\n");
 
     std::mt19937_64 rng(42);
-    roda("aleatorio, cardinalidade alta",   gera(n, 10'000'000, 0, rng));
-    roda("aleatorio, cardinalidade 10",     gera(n,         10, 0, rng));
-    roda("aleatorio, cardinalidade 64",     gera(n,         64, 0, rng));
-    roda("dente de serra (i % 1000)",       gera(n,          0, 1, rng));
-    roda("quase ordenado (0,1% de ruido)",  gera(n,          0, 2, rng));
-    roda("ja ordenado",                     gera(n,          0, 3, rng));
-    roda("invertido",                       gera(n,          0, 4, rng));
+    roda("aleatorio, chave de 64 bits",      gera(n,          0, 0, rng));
+    roda("aleatorio, cardinalidade alta",    gera(n, 10'000'000, 0, rng));
+    roda("aleatorio, cardinalidade 64",      gera(n,         64, 0, rng));
+    roda("aleatorio, cardinalidade 10",      gera(n,         10, 0, rng));
+    roda("dente de serra (i % 1000)",        gera(n,          0, 1, rng));
+    roda("dentes em faixas disjuntas",       gera(n,          0, 5, rng));
+    roda("idem, uma chave repetida no topo", gera(n,          0, 6, rng));
+    roda("quase ordenado (0,1% de ruido)",   gera(n,          0, 2, rng));
+    roda("ja ordenado",                      gera(n,          0, 3, rng));
+    roda("invertido",                        gera(n,          0, 4, rng));
 
-    printf("\nOs quatro ultimos cenarios sao ESTRUTURADOS: e onde o motor deveria\n");
-    printf("ganhar, porque ha estrutura para detectar. Os tres primeiros passam\n");
-    printf("pelo escudo de entropia e caem no fallback, entao medem o fallback.\n");
+    printf("\nOs seis ultimos cenarios sao ESTRUTURADOS: e onde o motor ganha por\n");
+    printf("detectar a estrutura, e ali sort e sort_by_radix_key fazem o mesmo\n");
+    printf("caminho. Os quatro primeiros passam pelo escudo de entropia: sort cai\n");
+    printf("no fallback por comparacao, sort_by_radix_key vai por radix.\n");
     return 0;
 }
