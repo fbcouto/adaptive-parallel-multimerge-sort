@@ -109,7 +109,7 @@ Four things changed in the shared machinery.
 - **Runs already in global order are joined in the metadata, before the tree.** The "already ordered" shortcut used to live inside the tree, where it was a `memcpy` per level. A thousand teeth in disjoint value ranges paid `log(1000)` copy passes; they now cost one comparison per boundary. The greedy scan also hands the *maximum* of a descending run to the ascending run before it, which blocks the join; that element is given back.
 - **Short runs are grouped and sorted as one block.** Merging run by run only pays when runs are long. Random data that slips past the sample becomes a sequence of blocks instead of millions of two-element runs.
 - **The tree only runs when it pays**: when, after joining, runs average at least 256 elements for cheap comparisons or 48 for expensive ones. Below that the block path ties or wins. Detection gives up early once the data proves too fragmented, so asking costs a fraction of a pass.
-- **The sample is eight windows spread over the array**, not one in the middle, and ties do not count as a direction — `4 4 3 3 2 2` used to read as pure chaos. The same sample times its own 512 comparisons to tell a cheap key from an expensive one; a preemption can only make a cheap key look expensive, which only withholds a shortcut.
+- **The sample is eight windows spread over the array**, not one in the middle, and ties do not count as a direction — `4 4 3 3 2 2` used to read as pure chaos. The same sample times its own 512 comparisons to tell a cheap key from an expensive one. The windows are read once before the clock starts, so the clock measures the comparison and not the cache misses of fetching the array. Until 2026-11-20 the cold reading was inside the measurement, and a one-instruction `u64` comparison, right after the array was copied, looked expensive in 25 to 36 of 60 calls on 10M elements on this laptop (in 19 to 42 of 60 on 100M on a 12-core EPYC). In those calls the unstable engine lost its quicksort shortcut: 10M almost-sorted `u64` took 105 to 162 ms instead of about 70 here, 100M about 735 ms instead of 295 there. What a comparison fetches outside the element — the bytes of a string — stays cold and still counts: `&str` reads as expensive in 60 of 60 calls either way, six to thirteen times over the limit. A preemption can only make a cheap key look expensive, which only withholds a shortcut; and for plain integers the key is cheap by definition, clock or no clock.
 
 Measured on 10M `u64`, 8 threads (i7-7700HQ, 4 cores), by `examples/vs_rayon.rs`: median of 15 rounds after a discarded warm-up, a fresh copy of the data outside the timer, and the order of the contenders drawn at random in every round. Each table of this README was measured twice, in two separate processes, and each cell is the lower of the two medians, because interference only ever adds time. Each row has two bands. The first is the stable pair: Rayon's `par_sort` against this crate's `sort_stable`, shown as `MM_sort_stable`. The second is the unstable pair: Rayon's `par_sort_unstable` against this crate's `sort`, shown as `MM_sort`. The column after each pair says how many times faster the `MM_` entry is. `sort_stable` runs twice in every round and the gap between its two medians is the noise floor of the row, 0.7% to 8%; a ratio reads *tie* when the difference fits inside that floor (5% at least) or is under 1 ms. In each band the winner is in large bold blue (rendered by GitHub's math extension; other Markdown viewers may show the raw markup); where the ratio reads *tie*, the blue only marks the lower of two numbers the measurement cannot tell apart:
 
@@ -152,9 +152,9 @@ A comparison sort cannot beat a parallel quicksort on random data by much. A sor
 | `sort_by_radix_key`, `sort_stable_by_radix_key` | a `u64` key decides the whole order | the element may carry data along: a `{key, row}` pair |
 | `sort_by_prefix_key`, `sort_stable_by_prefix_key` | a `u64` prefix plus a comparator that breaks ties | keys longer than 64 bits, such as text: the prefix is the first 8 bytes, big-endian |
 
-Nothing changes for ordered input: the sample, the run detector and the merge tree come first, and a sorted array still costs one pass. Only when the sample says "random" does the radix routine run:
+Nothing changes for ordered input: the sample, the run detector and the merge tree come first, and a sorted array still costs one pass. The radix routine runs when the sample says "random" and, when the comparison is cheap, also where comparison used to be the choice: on short runs, on fragmented data that is not globally ascending, and when more than 32 runs are left after joining (from 262K elements). Merging run by run moves the whole array once per level of the tree; the radix finishes in two passes whatever the order. Below 262K the tree works inside the cache and wins. The minimum size for the radix depends on what it competes with: against the block path (the stable engine; the unstable one on short runs or fragmented data) 8K elements, or 1K per thread when there are more than eight threads, up to 32K; against the parallel quicksort (the unstable engine on random data) 8K on one thread and 16K per thread above that — 32K per thread for elements wider than 8 bytes — capped at 131K for elements of up to 4 bytes and 524K for wider ones.
 
-1. **A 1,024-element sample.** If one bucket would hold more than a quarter of the data, the keys are skewed and the routine gives up before scanning anything.
+1. **A 1,024-element sample**, one position drawn at random inside each stride, so that periodic data — runs of equal length — cannot line up with it. If one bucket would hold more than a quarter of the data, the keys are skewed and the routine gives up before scanning anything. The stable engine with an exact key keeps going in two cases where a single pass finishes the job: when one digit covers every varying bit (a few values in a small range; from 524K elements), and when one key holds about half the data or more (from 262K): that key is split off into smaller, equal and greater in one pass, the equal part is done, and the two sides re-enter the routine.
 2. **Which bits vary.** A parallel AND/OR over the keys. The digit is taken from the highest bits *that vary*, so small, shifted or common-prefix keys do not all land in one bucket.
 3. **Counting**, when the element is the key and at most 16 bits vary: a parallel histogram and a parallel fill, with no buffer.
 4. **One MSD pass** on the top 8 varying bits, into 256 buckets, in parallel. The destination is carved beforehand into disjoint slices, one per bucket per chunk of input, so the scatter needs no `unsafe`.
@@ -182,8 +182,12 @@ What the table says:
 
 - **The price of stability disappears on random input.** The scatter visits the input chunks in order and the LSD pass is stable by construction, so the stable engine runs the same routine. Sorting 30M `{key, row}` pairs stably drops from 1.28 s to 0.61 s.
 - **The gain shrinks as the key widens.** A 32-bit key leaves 24 bits after the first pass, which a short LSD finishes inside the cache. A 64-bit key leaves 56, and the bucket falls back to a comparison sort.
-- **Skewed keys tie, by design.** The sample sees the skew and hands the array to the comparison path untouched; what is left is the cost of having asked, which the table cannot tell from noise.
+- **Skewed keys tie, by design.** The sample sees the skew and hands the array to the comparison path untouched; what is left is the cost of having asked, which the table cannot tell from noise. The exception is the stable engine with an exact key, which since 2026-11-20 takes the two one-pass cases described above (two or three values; a dominant key): measured on another machine (AMD EPYC 7B13, 1 and 8 threads), 1.0x to 3.9x over the comparison path in those cases, from 300K to 10M `{key, row}` pairs. Skew spread over a wide range — the row above — still gives up. The table above was not re-measured.
 - **Already-sorted input ties**, because the radix is never reached. That row is the control.
+
+**Where the radix also pays now.** The routing changes of 2026-11-20 — short runs, fragmented data and many runs going to the radix when the comparison is cheap — act on data with structure, which the table above does not have. Measured on an AMD EPYC 7B13 with 8 threads, with `vs_rayon u64` and the radix entries added to it, the engine before and after the changes side by side in one process, lowest median of two passes: `u64` almost sorted (1% swapped), `sort_stable_radix`: 5.2 → 2.6 ms at 1M, 59.8 → 26.5 ms at 10M, 616 → 279 ms at 100M; `u64`, 64 interleaved runs: 41.9 → 27.1 ms (stable) and 42.1 → 27.3 (unstable) at 10M, 365 → 271 and 365 → 273 at 100M. These were the two rows where the engine lost to Rayon's `par_sort` on that machine (29.2 and 52.4 ms at 10M). On `&str` through the prefix entries carried in pairs, stable, almost sorted 1%: 13.6 → 8.1 ms at 1M and 200 → 125 ms at 10M; 64 runs 13.7 → 9.5 and 167 → 146. The comparison entries `sort` and `sort_stable` measured equal; the shield fix of section 6 changes their path only in the calls where the old cost verdict was wrong.
+
+With the README's own programs at the README's sizes — the tables of this section and of section 6, whose data has no structure for the radix entries — the crate before and after the changes, each built on its own and run in alternating processes three times on the same EPYC, are equal: 143 of 147 cells within 5%, three faster by 6–7% and one slower by 6%, while Rayon's sorts, the same code in both binaries, varied by up to 24% between the two builds.
 
 **Text goes through the prefix entries.** A string is longer than 64 bits, so the engine gets its first 8 bytes as a `u64` prefix and the string comparison to break the ties. What makes it pay is computing the prefix once and carrying it next to the reference, as a `(prefix, &str)` pair: almost every comparison is then settled without touching the memory of the string. 5M `&str`, 8 threads, in ms (`vs_rayon prefix`): median of 7 rounds, measured twice like the tables above; the time to build the pairs and to write the sorted references back is inside the measurement:
 
@@ -348,7 +352,10 @@ of about forty minutes, so the machine was warm throughout: a short isolated
 run of the same harness reads 10 to 20% lower in absolute terms, with nearly
 the same ratios. The cache budgets, the block size, the k-way threshold and the
 radix thresholds were all tuned there and should be re-measured on the target
-hardware.
+hardware. The thresholds added on 2026-11-20 — the 32 runs and 262K elements
+above which the tree gives way to the radix, the 524K and 262K of the stable
+skew cases, the per-thread minimum size — were measured on an AMD EPYC 7B13
+(12 cores, 64 MB of L3) with 1 to 24 threads, not on this laptop.
 
 **An earlier version of the first table understated the engine.** It was
 measured with the k-way merge and the bidirectional leaf merge switched off: the
@@ -377,11 +384,18 @@ noise as a tie.
 
 Every release is checked by four independent layers:
 
-- 20 unit tests in Rust, which force every route and every radix leaf through
-  miniature thresholds, plus integration suites over the public API: stability
-  under duplicate keys, descending runs with plateaus, block boundary sizes, a
-  150-case structured/chaotic fuzz, and the radix entries on bare integers, keys
-  with a payload and prefix keys
+- 25 unit tests in Rust, which force every route and every radix leaf through
+  miniature thresholds — including, since 2026-11-20, the stable engine on
+  dominant and narrow keys (checked pair by pair against the standard stable
+  sort), the decisions of the radix routine on skewed keys (it takes the two
+  one-pass cases and gives up on wide skew without moving anything), the
+  classification of the skew sample, the "globally ascending" check on
+  interleaved runs, and the radix minimum size per competitor and thread
+  count; five deliberate mutations of that code are each caught — plus
+  integration suites over the public API: stability under duplicate keys,
+  descending runs with plateaus, block boundary sizes, a 150-case
+  structured/chaotic fuzz, and the radix entries on bare integers, keys with a
+  payload and prefix keys
 - A C++ stability suite over the same patterns, verifying that equal keys keep
   their original relative order and that the output is byte-identical to
   `std::stable_sort` — for `sort`, for the three radix entries, and for the

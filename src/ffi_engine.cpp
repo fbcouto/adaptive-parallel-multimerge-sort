@@ -114,8 +114,8 @@ int cxx_has_pstl(void) {
 }
 
 // Sequencial puro. Existe para UM proposito: o bench divide o tempo deste pelo
-// tempo do `par` e recusa a rodada se a razao nao chegar a 2x -- a checagem que
-// o CLAUDE.md exige, porque a falha do PSTL e silenciosa.
+// tempo do `par` e recusa a rodada se a razao nao chegar a 2x. A checagem e
+// obrigatoria porque a falha do PSTL e silenciosa: sem ele o `par` roda serial.
 void cxx_seq_sort_u64(uint64_t* ptr, size_t len) {
     std::stable_sort(ptr, ptr + len);
 }

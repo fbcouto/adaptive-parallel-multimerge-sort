@@ -351,6 +351,15 @@ pub(crate) struct Tuning {
     /// sort estavel em blocos, e o radix ja ganha em 32 mil (0,59 contra 0,79
     /// ms em i32; 0,54 contra 0,80 em u64) e empata em 16 mil.
     pub radix_min_stable: usize,
+    /// Radix: o piso do INSTAVEL em dado aleatorio com 1 thread. `radix_min` foi medido com
+    /// 8 threads, contra o quicksort paralelo; sem paralelismo o radix ganha de 8 mil elementos em
+    /// diante (1,3x a 1,9x em 8 mil; 1,4x a 3,1x de 16 mil a 262 mil).
+    pub radix_min_serial: usize,
+    /// Radix: o mesmo piso com mais de uma thread, em elementos POR THREAD, limitado a
+    /// `radix_min`. O quicksort paralelo escala com as threads e o radix pequeno nao. Medido: u64
+    /// passa a ganhar em 16-32 mil com 2 threads, 32-65 mil com 4, 131 mil com 8 e 262-524 mil
+    /// com 24; par de 16 bytes, em 16-65 mil, 131 mil, 262 mil e 524 mil.
+    pub radix_min_thread: usize,
     /// Radix: bits do digito da passada MSD. 8 venceu 10 (mais baldes custam
     /// mais no espalhamento do que economizam nas folhas).
     pub radix_digit: u32,
@@ -383,6 +392,10 @@ pub(crate) struct Tuning {
     pub radix_skew: usize,
     /// Radix: balde menor que isto vai direto para o sort da std.
     pub radix_leaf_min: usize,
+    /// Radix: com chave radix e comparacao barata, a arvore de fusao so e usada quando
+    /// sobram ate estes runs depois de encadear. Medido de 320 mil a 5M elementos, 1 a 24 threads:
+    /// com 8 runs a arvore ganha ou empata; com 48 o radix ja ganha ou empata em todos os casos.
+    pub radix_max_runs: usize,
     pub route: Route,
 }
 
@@ -408,7 +421,11 @@ impl Tuning {
             cheap_ns: 10,
             force_cheap: None,
             radix_min: if e <= 4 { 131_072 } else { 524_288 },
-            radix_min_stable: 32_768,
+            // Era 32_768. Medido de novo, contra o bloco estavel: em 8 mil o radix ganha
+            // por 1,2x a 1,7x com 1 a 8 threads, em 16 mil por 1,1x a 2,5x.
+            radix_min_stable: 8_192,
+            radix_min_serial: 8_192,
+            radix_min_thread: if e <= 8 { 16_384 } else { 32_768 },
             radix_digit: 8,
             radix_count_bits: 16,
             radix_lsd_cheap: 24,
@@ -419,7 +436,27 @@ impl Tuning {
             radix_recut: 65_536,
             radix_skew: 4,
             radix_leaf_min: 128,
+            radix_max_runs: 32,
             route: Route::Auto,
+        }
+    }
+
+    /// Abaixo de quantos elementos o caminho caotico segue por comparacao. Depende de quem
+    /// e o concorrente do radix naquele dado.
+    fn radix_floor(&self, stable: bool, kind: Chaos) -> usize {
+        let threads = rayon::current_num_threads().max(1);
+        // Blocos ordenados e fundidos: o caminho do motor estavel, e o do instavel quando o
+        // quicksort nao serve (runs curtos, dado fragmentado). O radix ganha deles desde cedo. Com
+        // muitas threads o piso sobe ate o valor antigo: com 24 threads o radix perde em 8 mil
+        // elementos (0,7x) e empata em 16 mil.
+        if stable || kind != Chaos::Random {
+            return self.radix_min_stable.max(1024 * threads).min(4 * self.radix_min_stable);
+        }
+        // Quicksort paralelo.
+        if threads == 1 {
+            self.radix_min_serial
+        } else {
+            self.radix_min.min(self.radix_min_thread.saturating_mul(threads))
         }
     }
 
@@ -476,7 +513,9 @@ pub(crate) fn sort_with_key<T, F, K>(
         Route::Auto => sample(arr, cmp, t.cheap_ns),
     };
     let rate = probe.rate;
-    let cheap = t.force_cheap.unwrap_or(probe.cheap);
+    // Com chave nua o elemento e um inteiro e a comparacao e barata por definicao: o
+    // cronometro nao decide.
+    let cheap = t.force_cheap.unwrap_or(probe.cheap || K::BARE);
     if rate > t.chaos_percent {
         let kind = if rate > t.random_percent { Chaos::Random } else { Chaos::ShortRuns };
         sort_chaotic(arr, cmp, stable, t, scratch, kind, cheap, key);
@@ -553,6 +592,7 @@ struct Probe {
 
 fn sample<T, F>(arr: &[T], cmp: &F, cheap_ns: usize) -> Probe
 where
+    T: Copy,
     F: Fn(&T, &T) -> Ordering,
 {
     const WINDOWS: usize = 8;
@@ -561,9 +601,26 @@ where
     if n < 3 {
         return Probe { rate: 0, cheap: false };
     }
-    let clock = std::time::Instant::now();
     let span = SPAN.min(n - 1);
     let last_start = n - 1 - span;
+    // As janelas sao lidas uma vez ANTES de ligar o relogio. O relogio mede o custo da
+    // comparacao, e ate aqui media junto a falta de cache de trazer cada janela da memoria, que e
+    // custo de ler o array: com u64 (comparacao de uma instrucao) as 512 comparacoes levavam 4,7 us
+    // frias contra 1,3 quentes, o limite e 5,1, e o veredito saia "cara" em 19 de 60 chamadas em
+    // 100M (25 de 60 em 10M num i7). Com o veredito errado o motor instavel perde o atalho do
+    // quicksort: 100M quase ordenado, ~735 ms em 7 de 12 chamadas contra ~295 nas outras. O que a
+    // comparacao busca FORA do elemento (os bytes de uma string) continua frio e continua contando:
+    // &str de 12 a 27 letras da 30 a 60 us nas duas formas, "cara" em 60 de 60.
+    for w in 0..WINDOWS {
+        let start = last_start / (WINDOWS - 1) * w;
+        for x in &arr[start..=start + span] {
+            std::hint::black_box(*x);
+        }
+        if last_start == 0 {
+            break;
+        }
+    }
+    let clock = std::time::Instant::now();
     let (mut seen, mut changes) = (0usize, 0usize);
     for w in 0..WINDOWS {
         let start = last_start / (WINDOWS - 1) * w;
@@ -610,11 +667,22 @@ where
         return false;
     }
     let step = n / (GROUPS * PER);
+    // Uma posicao ao acaso dentro de cada passo, em vez do comeco do passo. Com passo fixo
+    // a amostra cai em fase com dado periodico: em 100M de u64 com 64 runs intercalados sao
+    // exatamente 4 amostras por run, sempre nas mesmas fracoes do run, as 16 medianas saem quase
+    // iguais e nao decrescem, e a funcao responde "crescente" para o pior formato que o quicksort
+    // pode receber (762 ms contra 382 da arvore). Ate 2026-11-20 a pergunta so era feita para dado
+    // com milhares de runs curtos; desde que dado com mais de `radix_max_runs` runs longos tambem
+    // vai para o caminho caotico, ela aparece com dezenas de runs, e e ai que a fase aparece.
+    let mut seed = 0xA5A5_1F3D_9E37_79B9u64 ^ n as u64;
     let mut prev: Option<T> = None;
     for g in 0..GROUPS {
         let mut s = [arr[0]; PER];
         for (k, slot) in s.iter_mut().enumerate() {
-            *slot = arr[(g * PER + k) * step];
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            *slot = arr[(g * PER + k) * step + (seed % step as u64) as usize];
         }
         s.sort_unstable_by(|a, b| cmp(a, b));
         let med = s[PER / 2];
@@ -1182,6 +1250,19 @@ fn sort_structured<T, F, K>(
             sort_chaotic(arr, cmp, stable, t, scratch, Chaos::Fragmented, cheap, key);
             return;
         }
+        // Com chave radix e comparacao barata, fundir run a run so ganha do radix quando
+        // os runs sao poucos: cada nivel da arvore move o array inteiro, e o radix resolve em
+        // duas passadas seja qual for a ordem. So de 4 pedacos de espalhamento em diante (262 mil
+        // elementos): em 20 mil e 80 mil a arvore cabe no cache e ganha (ate 2x com 4 a 8 threads).
+        if K::ENABLED
+            && cheap
+            && n >= 4 * t.radix_piece
+            && plan.lens.len() > t.radix_max_runs
+            && runs_after_coalesce(arr, &plan, &offsets, cmp) > t.radix_max_runs
+        {
+            sort_chaotic(arr, cmp, stable, t, scratch, Chaos::Fragmented, cheap, key);
+            return;
+        }
         // O escudo foi enganado e a maior parte do dado nao tem run que se
         // aproveite. O estavel segue: os blocos `Sort` do plano ja sao o
         // caminho caotico dele. O instavel escolhe pelo comprimento medio do
@@ -1269,8 +1350,15 @@ fn sort_chaotic<T, F, K>(
     // buffer) nada foi movido e o caminho por comparacao abaixo segue igual.
     // Runs curtos e dado fragmentado continuam por comparacao: ali ha ordem
     // local que o radix nao aproveita.
-    let radix_min = if stable { t.radix_min_stable } else { t.radix_min };
-    if K::ENABLED && kind == Chaos::Random && arr.len() >= radix_min {
+    // O melhor caso do quicksort: dado fragmentado mas globalmente crescente, com
+    // comparacao barata. Ele ganha do radix ali, entao e conferido antes.
+    let ascending_noise = !stable && cheap && kind == Chaos::Fragmented && globally_ascending(arr, cmp);
+    // Com chave radix e comparacao barata, runs curtos e dado fragmentado tambem vao para
+    // o radix: ele custa quase o mesmo em qualquer ordem, e os blocos por comparacao levam o dobro.
+    let radix_fits = kind == Chaos::Random || (cheap && !ascending_noise);
+    // O piso depende de quem e o concorrente do radix neste dado: ver `radix_floor`.
+    let radix_min = t.radix_floor(stable, kind);
+    if K::ENABLED && radix_fits && arr.len() >= radix_min {
         // No estavel a folha por comparacao e o `sort` estavel, mais caro que
         // o `sort_unstable`: o LSD compensa por mais passadas mesmo com
         // comparacao barata (texto de 6 bytes em u64, 30M: 384 ms com folha
@@ -1304,7 +1392,7 @@ fn sort_chaotic<T, F, K>(
         let quick = match kind {
             Chaos::Random => true,
             Chaos::ShortRuns => false,
-            Chaos::Fragmented => cheap && globally_ascending(arr, cmp),
+            Chaos::Fragmented => ascending_noise,
         };
         if quick {
             arr.par_sort_unstable_by(|a, b| cmp(a, b));
@@ -1354,7 +1442,7 @@ fn sort_chaotic<T, F, K>(
 //    6. Balde grande demais passa pela rotina de novo.
 //
 //  Medido em 30M / 100M aleatorios, 8 threads, buffer alocado no cronometro,
-//  contra o quicksort paralelo (protótipo de 2026-11-17, ver CLAUDE.md):
+//  contra o quicksort paralelo (protótipo de 2026-11-17):
 //  i32 344 -> 152 ms / 1274 -> 528; u64 406 -> 278 / 1463 -> 1084; 64 valores
 //  em i32 132 -> 23; enviesado (90% em 0..1000) empata.
 //
@@ -1485,27 +1573,63 @@ where
         return true;
     }
     let t = rx.t;
-    if radix_skewed(arr, rx.key, t) {
-        return false;
+    // Chave enviesada (um balde com mais de 1/4 do dado) faz o radix desistir, porque o
+    // espalhamento nao divide o trabalho. No motor instavel a alternativa e o quicksort, que
+    // resolve chaves repetidas de passagem. No ESTAVEL a alternativa sao os blocos ordenados por
+    // comparacao e fundidos, e ha dois casos em que o radix termina em UMA passada e ganha deles:
+    //
+    //  uma chave so tem mais da metade do dado: sai numa separacao em tres partes. De 4
+    //          pedacos de espalhamento em diante (em 300 mil: 1,2x a 2,9x).
+    //  um digito cobre todos os bits que variam: o espalhamento ja deixa tudo em ordem. De
+    //          8 pedacos em diante (duas e tres chaves: 0,8x a 1,1x em 300 mil; 1,0x a 1,9x em 1M).
+    //
+    // Fora deles (cauda pesada, concentracao numa faixa larga) o radix precisaria de varios
+    // niveis, cada um movendo quase tudo, e perde: 0,44x a 0,92x. Continua desistindo.
+    let one_key = K::EXACT && rx.stable && n >= 4 * t.radix_piece;
+    let one_digit = one_key && n >= 8 * t.radix_piece;
+    let skew = radix_skewed(arr, rx.key, t);
+    match skew {
+        Skew::No => {}
+        Skew::OneKey if one_key => {}
+        Skew::OneDigit if one_digit => {}
+        _ => return false,
     }
-    let (and, or) = radix_range(arr, rx.key);
-    let diff = and ^ or;
-    if diff == 0 {
-        // Todas as chaves iguais. Com chave exata nao ha o que ordenar; com
-        // prefixo, ele nao distingue nada e a comparacao assume.
-        return K::EXACT;
+    // A amostra viu uma chave dominante: a contagem dela vem antes de qualquer outra
+    // varredura. Se a contagem desmentir a amostra, desistir custou uma passada de leitura.
+    let mut pivot = None;
+    if skew == Skew::OneKey {
+        match radix_pivot_plan(arr, rx.key, t) {
+            Some(p) if p.eq == n => return true, // uma chave so: nada a ordenar
+            Some(p) => pivot = Some(p),
+            None => return false,
+        }
     }
-    let hi = 64 - diff.leading_zeros();
-    if K::BARE && hi <= t.radix_count_bits {
-        radix_count(arr, rx.key, or, hi);
-        return true;
+    let mut plan = None;
+    if pivot.is_none() {
+        let (and, or) = radix_range(arr, rx.key);
+        let diff = and ^ or;
+        if diff == 0 {
+            // Todas as chaves iguais. Com chave exata nao ha o que ordenar; com
+            // prefixo, ele nao distingue nada e a comparacao assume.
+            return K::EXACT;
+        }
+        let hi = 64 - diff.leading_zeros();
+        if K::BARE && hi <= t.radix_count_bits {
+            radix_count(arr, rx.key, or, hi);
+            return true;
+        }
+        // O histograma vem ANTES do buffer: se a chave for enviesada, desistir
+        // nao custou nem a alocacao.
+        plan = radix_plan(arr, rx.key, t, hi, one_digit);
+        // A amostra nao viu, mas o histograma exato acusou concentracao: vale conferir se
+        // e uma chave so, tambem antes do buffer.
+        if plan.is_none() && one_key {
+            pivot = radix_pivot_plan(arr, rx.key, t);
+        }
+        if plan.is_none() && pivot.is_none() {
+            return false;
+        }
     }
-    // O histograma vem ANTES do buffer: se a chave for enviesada, desistir
-    // nao custou nem a alocacao.
-    let plan = match radix_plan(arr, rx.key, t, hi) {
-        Some(p) => p,
-        None => return false,
-    };
     let mut owned: Vec<T> = Vec::new();
     let buf: &mut [T] = match scratch {
         Some(v) if v.len() >= n => &mut v[..n],
@@ -1525,42 +1649,93 @@ where
             &mut owned[..]
         }
     };
-    radix_scatter(arr, buf, &plan, rx.key);
-    radix_buckets(arr, buf, &plan, rx, 0);
+    match (&plan, &pivot) {
+        (Some(p), _) => {
+            radix_scatter(arr, buf, p, rx.key);
+            radix_buckets(arr, buf, p, rx, 0);
+        }
+        (None, Some(pv)) => radix_pivot(arr, buf, pv, rx, 0),
+        (None, None) => unreachable!("sem plano o radix ja desistiu"),
+    }
     true
+}
+
+/// O que a amostra diz da chave.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Skew {
+    /// Nenhum balde dos bits altos passa de 1/`radix_skew` da amostra.
+    No,
+    /// Enviesada, mas um digito cobre todos os bits que variam.
+    OneDigit,
+    /// Enviesada, e uma chave so tem pelo menos metade da amostra.
+    OneKey,
+    /// Enviesada e espalhada por mais de um digito, sem chave dominante.
+    Wide,
 }
 
 /// A chave e enviesada? Olha 1024 elementos espalhados: se a faixa deles e
 /// larga e um balde dos bits altos fica com mais de 1/`radix_skew` da amostra,
 /// o espalhamento nao dividiria o trabalho.
-fn radix_skewed<T, K>(a: &[T], key: &K, t: &Tuning) -> bool
+fn radix_skewed<T, K>(a: &[T], key: &K, t: &Tuning) -> Skew
 where
     K: Keyer<T>,
 {
     let n = a.len();
     let m = 1024.min(n);
     let step = n / m;
+    // Uma posicao ao acaso dentro de cada passo, em vez do comeco do passo. Com passo fixo,
+    // dado periodico engana a amostra: 512 runs do mesmo comprimento em 640 mil elementos poem
+    // metade das amostras no MENOR valor de cada run, e a chave parece enviesada sem ser.
+    let mut seed = 0x9E37_79B9_7F4A_7C15u64 ^ n as u64;
+    let mut keys: Vec<u64> = (0..m)
+        .map(|i| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            key.bits(&a[i * step + (seed % step as u64) as usize])
+        })
+        .collect();
     let (mut and, mut or) = (u64::MAX, 0u64);
-    for i in 0..m {
-        let b = key.bits(&a[i * step]);
+    for &b in &keys {
         and &= b;
         or |= b;
     }
     let hi = 64 - (and ^ or).leading_zeros();
     if K::BARE && hi <= t.radix_count_bits {
-        return false; // candidato a contagem; a varredura exata decide
+        return Skew::No; // candidato a contagem; a varredura exata decide
     }
     if hi == 0 {
-        return true; // a amostra inteira tem a mesma chave
+        return Skew::OneKey; // a amostra inteira tem a mesma chave
     }
     let b = t.radix_digit.clamp(1, hi.min(16));
     let shift = hi - b;
     let mask = (1u64 << b) - 1;
     let mut h = vec![0usize; 1usize << b];
-    for i in 0..m {
-        h[((key.bits(&a[i * step]) >> shift) & mask) as usize] += 1;
+    for &k in &keys {
+        h[((k >> shift) & mask) as usize] += 1;
     }
-    h.iter().any(|&c| c * t.radix_skew > m)
+    if !h.iter().any(|&c| c * t.radix_skew > m) {
+        return Skew::No;
+    }
+    // Enviesada. O radix ainda termina em uma passada?
+    if shift == 0 {
+        return Skew::OneDigit;
+    }
+    keys.sort_unstable();
+    let (mut best, mut i) = (0usize, 0usize);
+    while i < m {
+        let mut j = i + 1;
+        while j < m && keys[j] == keys[i] {
+            j += 1;
+        }
+        best = best.max(j - i);
+        i = j;
+    }
+    if best * 2 >= m {
+        Skew::OneKey
+    } else {
+        Skew::Wide
+    }
 }
 
 /// AND e OR de todas as chaves: os bits em que diferem sao os que variam.
@@ -1637,7 +1812,10 @@ struct RadixPlan {
 
 /// Conta o digito MSD -- os `radix_digit` bits mais altos entre os `hi` que
 /// variam. `None` se um balde ficaria com mais de 1/`radix_skew` do trecho.
-fn radix_plan<T, K>(a: &[T], key: &K, t: &Tuning, hi: u32) -> Option<RadixPlan>
+///
+/// Com `one_digit`, o balde dominante e aceito quando o digito cobre todos os bits que
+/// variam: depois do espalhamento nao sobra nada por ordenar.
+fn radix_plan<T, K>(a: &[T], key: &K, t: &Tuning, hi: u32, one_digit: bool) -> Option<RadixPlan>
 where
     T: Sync,
     K: Keyer<T>,
@@ -1664,7 +1842,7 @@ where
         bounds[d + 1] = bounds[d] + hists.iter().map(|h| h[d]).sum::<usize>();
     }
     let limit = n / t.radix_skew.max(1);
-    if (0..nb).any(|d| bounds[d + 1] - bounds[d] > limit) {
+    if !(one_digit && shift == 0) && (0..nb).any(|d| bounds[d + 1] - bounds[d] > limit) {
         return None;
     }
     Some(RadixPlan { shift, mask, nb, chunk, hists, bounds })
@@ -1772,13 +1950,158 @@ where
         radix_count(a, rx.key, or, hi);
         return;
     }
-    match radix_plan(a, rx.key, rx.t, hi) {
+    // Aqui o radix ja comecou e a alternativa e ordenar o balde inteiro por
+    // comparacao: os dois casos de uma passada valem para balde de qualquer tamanho.
+    let one_pass = K::EXACT && rx.stable;
+    match radix_plan(a, rx.key, rx.t, hi, one_pass) {
         Some(p) => {
             radix_scatter(a, s, &p, rx.key);
             radix_buckets(a, s, &p, rx, depth);
         }
-        None => radix_fallback(a, rx.cmp, rx.stable),
+        None => {
+            if one_pass && depth < 6 {
+                if let Some(pv) = radix_pivot_plan(a, rx.key, rx.t) {
+                    radix_pivot(a, s, &pv, rx, depth);
+                    return;
+                }
+            }
+            radix_fallback(a, rx.cmp, rx.stable)
+        }
     }
+}
+
+/// A chave dominante de um trecho e a contagem exata das tres partes.
+struct PivotPlan {
+    pivot: u64,
+    /// Elementos por pedaco.
+    chunk: usize,
+    /// Por pedaco: quantos menores, iguais e maiores que `pivot`.
+    hists: Vec<[usize; 3]>,
+    lt: usize,
+    eq: usize,
+}
+
+/// 0: menor que a chave dominante; 1: igual; 2: maior.
+#[inline(always)]
+fn pivot_side(bits: u64, pivot: u64) -> usize {
+    (bits >= pivot) as usize + (bits > pivot) as usize
+}
+
+/// Uma chave so tem pelo menos metade do trecho? A candidata e a moda de 256 amostras; a
+/// contagem exata, paralela, confirma. Nao move nada.
+fn radix_pivot_plan<T, K>(a: &[T], key: &K, t: &Tuning) -> Option<PivotPlan>
+where
+    T: Sync,
+    K: Keyer<T>,
+{
+    let n = a.len();
+    if n < 2 {
+        return None;
+    }
+    let m = 256.min(n);
+    let step = n / m;
+    let mut seed = 0xD1B5_4A32_D192_ED03u64 ^ n as u64;
+    let mut keys: Vec<u64> = (0..m)
+        .map(|i| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            key.bits(&a[i * step + (seed % step as u64) as usize])
+        })
+        .collect();
+    keys.sort_unstable();
+    let (mut pivot, mut best, mut i) = (keys[0], 0usize, 0usize);
+    while i < m {
+        let mut j = i + 1;
+        while j < m && keys[j] == keys[i] {
+            j += 1;
+        }
+        if j - i > best {
+            best = j - i;
+            pivot = keys[i];
+        }
+        i = j;
+    }
+    // Folga para o erro da amostra; quem decide e a contagem.
+    if best * 5 < m * 2 {
+        return None;
+    }
+    let pieces = (n / t.radix_piece.max(1)).clamp(1, 128);
+    let chunk = (n + pieces - 1) / pieces;
+    let hists: Vec<[usize; 3]> = a
+        .par_chunks(chunk)
+        .map(|c| {
+            let mut h = [0usize; 3];
+            for x in c {
+                h[pivot_side(key.bits(x), pivot)] += 1;
+            }
+            h
+        })
+        .collect();
+    let lt: usize = hists.iter().map(|h| h[0]).sum();
+    let eq: usize = hists.iter().map(|h| h[1]).sum();
+    // A amostra de entrada exige metade; a contagem aceita de 40% em diante. Com o mesmo corte nas
+    // duas, uma chave com exatamente metade do dado passaria na amostra e cairia aqui ao acaso,
+    // pagando as varreduras sem aproveitar (medido: 0,91x a 0,93x em 1M).
+    if eq * 5 < n * 2 {
+        return None;
+    }
+    Some(PivotPlan { pivot, chunk, hists, lt, eq })
+}
+
+/// Separa o trecho em menores, iguais e maiores que a chave dominante. O dado esta em
+/// `a`; `s` e rascunho; o resultado termina em `a`.
+///
+/// O espalhamento percorre os pedacos em ordem, como o da passada MSD: os iguais ficam prontos e
+/// na ordem em que vieram. As partes de fora, que somam menos da metade, voltam para a rotina.
+fn radix_pivot<T, F, K>(a: &mut [T], s: &mut [T], p: &PivotPlan, rx: &Radix<F, K>, depth: u32)
+where
+    T: Copy + Send + Sync,
+    F: Fn(&T, &T) -> Ordering + Sync,
+    K: Keyer<T>,
+{
+    let t = rx.t;
+    {
+        let mut slots: Vec<Vec<&mut [T]>> =
+            (0..p.hists.len()).map(|_| Vec::with_capacity(3)).collect();
+        let mut rest: &mut [T] = &mut *s;
+        for d in 0..3 {
+            for (piece, h) in p.hists.iter().enumerate() {
+                let (head, r) = std::mem::take(&mut rest).split_at_mut(h[d]);
+                slots[piece].push(head);
+                rest = r;
+            }
+        }
+        a.par_chunks(p.chunk).zip(slots.into_par_iter()).for_each(|(c, mut cur)| {
+            for x in c {
+                let d = pivot_side(rx.key.bits(x), p.pivot);
+                let slot = std::mem::take(&mut cur[d]);
+                if let Some((head, tail)) = slot.split_first_mut() {
+                    *head = *x;
+                    cur[d] = tail;
+                }
+            }
+        });
+    }
+    let (a_lt, a_rest) = a.split_at_mut(p.lt);
+    let (a_eq, a_gt) = a_rest.split_at_mut(p.eq);
+    let (s_lt, s_rest) = s.split_at_mut(p.lt);
+    let (s_eq, s_gt) = s_rest.split_at_mut(p.eq);
+    let finish = |x: &mut [T], y: &mut [T]| {
+        if x.is_empty() {
+            return;
+        }
+        par_copy(x, y, t.par_grain);
+        if x.len() > t.small_sort {
+            radix_bucket(x, y, rx, depth + 1);
+        } else {
+            leaf_sort(x, rx.cmp, rx.stable);
+        }
+    };
+    rayon::join(
+        || par_copy(a_eq, s_eq, t.par_grain),
+        || rayon::join(|| finish(a_lt, s_lt), || finish(a_gt, s_gt)),
+    );
 }
 
 /// Radix LSD sequencial de um balde, sobre os `low_bits` de baixo da chave
@@ -2464,6 +2787,8 @@ mod tests {
             // passar por todas as folhas com poucas centenas de elementos.
             radix_min: 8,
             radix_min_stable: 8,
+            radix_min_serial: 8,
+            radix_min_thread: 8,
             radix_digit: 2,
             radix_count_bits: 2,
             radix_lsd_cheap: 8,
@@ -2474,6 +2799,7 @@ mod tests {
             radix_recut: 12,
             radix_skew: 2,
             radix_leaf_min: 4,
+            radix_max_runs: 4,
             route,
         }
     }
@@ -3166,6 +3492,178 @@ mod tests {
             let v = keyed((0..n as u32).map(|i| (n as u32 - i) / 3));
             check_stable(&v, &t, &format!("invertido n={n}"));
             check_unstable(&v, &t, &format!("invertido n={n}"));
+        }
+    }
+
+    // ----------------------------------------------- mudancas de 2026-11-20
+
+    /// Chave exata com um valor dominante, ou com poucos valores numa faixa
+    /// pequena: o estavel segue pelo radix em uma passada e tem que sair
+    /// identico, par a par, ao sort estavel da std. Com `tiny` os pisos sao
+    /// 64 e 128 elementos; com o ajuste padrao, 262 mil e 524 mil.
+    #[test]
+    fn radix_stable_keeps_order_with_dominant_and_narrow_keys() {
+        let mut rng = StdRng::seed_from_u64(81);
+        let key = Exact(|k: &Keyed| k.key as u64);
+        let formatos: Vec<(&str, Box<dyn Fn(&mut StdRng) -> u32>)> = vec![
+            ("2 valores", Box::new(|r: &mut StdRng| r.gen_range(0..2u32))),
+            ("3 valores distantes", Box::new(|r: &mut StdRng| [0u32, 1 << 20, u32::MAX][r.gen_range(0..3)])),
+            ("50% num valor", Box::new(|r: &mut StdRng| if r.gen_bool(0.5) { 7 } else { r.gen() })),
+            ("90% num valor", Box::new(|r: &mut StdRng| if r.gen_bool(0.9) { 7 } else { r.gen() })),
+            ("99,9% no maior", Box::new(|r: &mut StdRng| if r.gen_bool(0.999) { u32::MAX } else { r.gen() })),
+            (
+                "55% A, 25% B, 12% C, resto",
+                Box::new(|r: &mut StdRng| match r.gen_range(0..100u32) {
+                    0..=54 => 1 << 20,
+                    55..=79 => 9,
+                    80..=91 => u32::MAX - 3,
+                    _ => r.gen(),
+                }),
+            ),
+            ("geometrica", Box::new(|r: &mut StdRng| r.gen::<u32>().leading_zeros())),
+        ];
+        let unstable_ok = |w: &[Keyed], v: &[Keyed], what: &str| {
+            assert!(w.windows(2).all(|p| p[0].key <= p[1].key), "instavel nao ordenou: {what}");
+            let (mut got, mut exp) = (pairs(w), pairs(v));
+            got.sort_unstable();
+            exp.sort_unstable();
+            assert_eq!(got, exp, "instavel perdeu ou duplicou: {what}");
+        };
+        for trial in 0..280 {
+            let (nome, gera) = &formatos[trial % formatos.len()];
+            let n = rng.gen_range(0..2500);
+            let v = keyed((0..n).map(|_| gera(&mut rng)));
+            let t = tiny([Route::Chaotic, Route::Auto][trial % 2]);
+            let mut reference = v.clone();
+            reference.sort();
+            let mut w = v.clone();
+            sort_with_key(&mut w, &Keyed::cmp, true, &t, None, &key);
+            assert_eq!(pairs(&w), pairs(&reference), "estavel, {nome}, ensaio {trial}");
+            let mut w = v.clone();
+            sort_with_key(&mut w, &Keyed::cmp, false, &t, None, &key);
+            unstable_ok(&w, &v, &format!("{nome}, ensaio {trial}"));
+        }
+        // Tamanho real, API publica, acima dos dois pisos.
+        for (nome, gera) in &formatos {
+            for n in [300_000usize, 600_000] {
+                let v = keyed((0..n).map(|_| gera(&mut rng)));
+                let mut reference = v.clone();
+                reference.sort();
+                let mut a = v.clone();
+                multi_merge_sort_stable_by_radix_key(&mut a, |k| k.key as u64);
+                assert_eq!(pairs(&a), pairs(&reference), "estavel, {nome}, n={n}");
+                let mut b = v.clone();
+                multi_merge_sort_by_radix_key(&mut b, |k| k.key as u64);
+                unstable_ok(&b, &v, &format!("{nome}, n={n}"));
+            }
+        }
+    }
+
+    /// A amostra do radix diz QUE enviesamento e -- um digito cobre a faixa,
+    /// uma chave domina, ou enviesado largo -- e nao se deixa enganar por dado
+    /// periodico: com passo fixo, 512 runs do mesmo comprimento faziam a
+    /// amostra cair sempre no menor valor de cada run e ver duas chaves.
+    #[test]
+    fn radix_sample_classifies_the_skew_and_ignores_the_period_of_the_data() {
+        let t = Tuning::for_type::<u64>();
+        let key = Exact(|x: &u64| *x);
+        let mut rng = StdRng::seed_from_u64(84);
+        let n = 640_000usize;
+        let three: Vec<u64> = (0..n).map(|_| rng.gen_range(0..3u64)).collect();
+        assert_eq!(radix_skewed(&three, &key, &t), Skew::OneDigit);
+        let dominant: Vec<u64> = (0..n).map(|_| if rng.gen_bool(0.9) { 7 } else { rng.gen() }).collect();
+        assert_eq!(radix_skewed(&dominant, &key, &t), Skew::OneKey);
+        let wide: Vec<u64> =
+            (0..n).map(|_| if rng.gen_bool(0.9) { rng.gen_range(0..1000u64) } else { rng.gen() }).collect();
+        assert_eq!(radix_skewed(&wide, &key, &t), Skew::Wide);
+        let random: Vec<u64> = (0..n).map(|_| rng.gen()).collect();
+        assert_eq!(radix_skewed(&random, &key, &t), Skew::No);
+        let l = n / 512;
+        let saw: Vec<u64> = (0..n).map(|i| (((i % l) as u64) << 24) | (i / l) as u64).collect();
+        assert_eq!(radix_skewed(&saw, &key, &t), Skew::No);
+    }
+
+    /// A pergunta "globalmente crescente?" com 64 runs intercalados: com passo
+    /// fixo cada run cabia em 4 passos, os 16 grupos viam sempre as mesmas
+    /// fracoes de cada run, as medianas cresciam com o run e a resposta era
+    /// "crescente" -- e o dado ia para o quicksort, que e ruim nesse formato.
+    #[test]
+    fn globally_ascending_is_not_fooled_by_interleaved_runs() {
+        let cmp = |a: &u64, b: &u64| a.cmp(b);
+        for n in [65_536usize, 262_144, 1_048_576] {
+            let per = n / 64;
+            let v: Vec<u64> = (0..64u64).flat_map(|r| (0..per as u64).map(move |i| i * 64 + r)).collect();
+            assert!(!globally_ascending(&v, &cmp), "64 runs intercalados, n={n}");
+        }
+        // O que ela existe para aceitar: ordenado com elementos fora do lugar.
+        let mut rng = StdRng::seed_from_u64(83);
+        let n = 1_000_000usize;
+        let mut q: Vec<u64> = (0..n as u64).collect();
+        for _ in 0..n / 100 {
+            let (a, b) = (rng.gen_range(0..n), rng.gen_range(0..n));
+            q.swap(a, b);
+        }
+        assert!(globally_ascending(&q, &cmp), "ordenado com 1% de trocas");
+        let r: Vec<u64> = (0..n).map(|_| rng.gen()).collect();
+        assert!(!globally_ascending(&r, &cmp), "aleatorio");
+    }
+
+    /// O piso do radix depende de quem e o concorrente: os blocos (estavel,
+    /// runs curtos, fragmentado) ou o quicksort paralelo (instavel aleatorio),
+    /// e do numero de threads.
+    #[test]
+    fn radix_floor_depends_on_the_competitor_and_the_threads() {
+        let t = Tuning::for_type::<u64>();
+        let pool = |n: usize| rayon::ThreadPoolBuilder::new().num_threads(n).build().unwrap();
+        // Contra os blocos: 8 mil, subindo com mil por thread ate 32 mil.
+        assert_eq!(pool(1).install(|| t.radix_floor(true, Chaos::Random)), t.radix_min_stable);
+        assert_eq!(pool(4).install(|| t.radix_floor(false, Chaos::ShortRuns)), t.radix_min_stable);
+        assert_eq!(pool(16).install(|| t.radix_floor(false, Chaos::Fragmented)), 16 * 1024);
+        assert_eq!(pool(64).install(|| t.radix_floor(true, Chaos::Random)), 4 * t.radix_min_stable);
+        // Contra o quicksort: 8 mil com 1 thread, 16 mil por thread depois, ate o piso antigo.
+        assert_eq!(pool(1).install(|| t.radix_floor(false, Chaos::Random)), t.radix_min_serial);
+        assert_eq!(pool(4).install(|| t.radix_floor(false, Chaos::Random)), 4 * t.radix_min_thread);
+        assert_eq!(pool(64).install(|| t.radix_floor(false, Chaos::Random)), t.radix_min);
+        assert!(t.radix_min_serial <= t.radix_min_thread && 4 * t.radix_min_thread <= t.radix_min);
+    }
+
+    /// As decisoes da rotina, e nao so o resultado (cair na comparacao tambem
+    /// daria a saida certa): com o ajuste padrao, o estavel com chave exata
+    /// segue pelo radix nos dois casos de uma passada -- um digito cobre a
+    /// faixa (de 524 mil), uma chave domina (de 262 mil) -- e desiste SEM
+    /// MOVER NADA quando o enviesamento e largo. O instavel desiste nos tres:
+    /// ali o quicksort resolve chaves repetidas de passagem.
+    #[test]
+    fn radix_stable_takes_the_one_pass_cases_and_gives_up_on_wide_skew() {
+        let mut rng = StdRng::seed_from_u64(85);
+        let t = Tuning::for_type::<Keyed>();
+        let key = Exact(|k: &Keyed| k.key as u64);
+        let cmp = |a: &Keyed, b: &Keyed| a.key.cmp(&b.key);
+        let roda = |v: &[Keyed], stable: bool| -> (bool, Vec<Keyed>) {
+            let rx = Radix { cmp: &cmp, key: &key, stable, t: &t, lsd_max: t.radix_lsd_costly };
+            let mut w = v.to_vec();
+            let usou = radix_sort(&mut w, &rx, None);
+            (usou, w)
+        };
+        let tres = keyed((0..600_000).map(|_| rng.gen_range(0..3u32)));
+        let domina = keyed((0..300_000).map(|_| if rng.gen_bool(0.9) { 7 } else { rng.gen() }));
+        for (nome, v) in [("tres valores", &tres), ("chave dominante", &domina)] {
+            let mut reference = v.clone();
+            reference.sort();
+            let (usou, w) = roda(v, true);
+            assert!(usou, "estavel, {nome}: o radix desistiu");
+            assert_eq!(pairs(&w), pairs(&reference), "estavel, {nome}");
+            let (usou, w) = roda(v, false);
+            assert!(!usou, "instavel, {nome}: o radix devia desistir");
+            assert_eq!(pairs(&w), pairs(v), "instavel, {nome}: desistiu mas mexeu no dado");
+        }
+        let largo = keyed(
+            (0..600_000).map(|_| if rng.gen_bool(0.9) { rng.gen_range(0..1000u32) } else { rng.gen() }),
+        );
+        for stable in [true, false] {
+            let (usou, w) = roda(&largo, stable);
+            assert!(!usou, "enviesado largo, estavel={stable}: o radix devia desistir");
+            assert_eq!(pairs(&w), pairs(&largo), "enviesado largo, estavel={stable}: mexeu no dado");
         }
     }
 }
