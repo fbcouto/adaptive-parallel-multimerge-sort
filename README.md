@@ -6,6 +6,8 @@ The algorithm is built on a single observation: real database keys are almost ne
 
 Against `std::stable_sort(std::execution::par, ...)` — the parallel stable sort of the C++17 standard library — it is **12x faster on reversed data, 2.9x on sorted data and 1.27x on almost-sorted data**, and costs at most 8% where there is no structure at all. Those first three are the shape of a rebuilt index, a table in insertion order, a segment merged by a previous operation: the common case in a database, and the one a general-purpose sort pays full price for.
 
+The engine has been fitted into two SQL engines and measured with each one's own tests: an extension operator for Apache DataFusion and a prototype in ClickHouse (see [Integrations](#-integrations)).
+
 # 📚 Academic Background & Prior Work
 
 The core theoretical foundation of this parallel architecture is based on the original research and paper:
@@ -597,6 +599,28 @@ int main() {
 nothing else: the k-way merge and the bidirectional leaf merge are on by
 default, and chaotic input falls back to the internal sort unless
 `-DMULTIMERGE_PSTL` (plus `-ltbb`) points it at the standard parallel one.
+
+## 🔌 Integrations
+
+The engine has been fitted into two SQL engines. Each carries a copy of `src/multimerge.rs` (version 2.1.0, without its tests), and each was measured with the host engine's own tests. Both are experimental, and both have been put to that engine's maintainers.
+
+### Apache DataFusion: an extension operator
+
+[`multimerge-datafusion`](https://github.com/fbcouto/multimerge_apache_Datafusion) is a Rust crate with `MultimergeSortExec`, a sort operator that a physical optimizer rule puts in place of DataFusion's final merge (`SortPreservingMergeExec`), or of the whole sort. DataFusion itself does not change.
+
+- On the sort queries of DataFusion's `sort_tpch` benchmark, replacing only the final merge is 3.98x faster than DataFusion's own plan at TPC-H scale factor 1 with the table in memory, 3.17x reading Parquet, and 3.48x at scale factor 10 (geometric means, 24 partitions).
+- DataFusion's SQL test suite (sqllogictest, 502 files) ran with the rule installed: in the final-merge mode, the only differences are `EXPLAIN` output.
+- A [5-minute video](https://youtu.be/6IBn_Cl8D_Q) presents it, and the measurements are offered in [apache/datafusion#21381](https://github.com/apache/datafusion/issues/21381#issuecomment-7062844145).
+
+### ClickHouse: a prototype on a fork
+
+The branch [`multimerge-sort`](https://github.com/fbcouto/ClickHouse/tree/multimerge-sort/multimerge) adds `MultimergeSortedTransform`, which can take the place of ClickHouse's single-threaded final merge of an `ORDER BY` without `LIMIT` (`MergingSortedTransform`), or do the whole sort. It is off by default, behind experimental settings.
+
+- On ClickHouse's own sort performance tests (81 queries, 24 vCPUs), it is 2.15x faster as the final merge and 3.22x as the whole sort (geometric means over the queries it handles).
+- ClickHouse's 856 sort-related functional tests ran with it forced on: no result changed.
+- A [4½-minute video](https://youtu.be/mEXKimDtu-8) presents it, and the questions for the maintainers are in [ClickHouse/ClickHouse#133443](https://github.com/ClickHouse/ClickHouse/issues/133443).
+
+Both videos are narrated with a synthetic voice reading the author's script.
 
 
 
