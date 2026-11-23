@@ -621,9 +621,9 @@ The engine has been fitted into two SQL engines. Each carries a copy of `src/mul
 
 The branch [`multimerge-sort`](https://github.com/fbcouto/ClickHouse/tree/multimerge-sort/multimerge) adds `MultimergeSortedTransform`, which can take the place of ClickHouse's single-threaded final merge of an `ORDER BY` without `LIMIT` (`MergingSortedTransform`), or do the whole sort. It is off by default, behind experimental settings.
 
-- On ClickHouse's own sort performance tests (81 queries, 24 vCPUs), it is 2.15x faster as the final merge and 3.22x as the whole sort (geometric means over the queries it handles).
-- ClickHouse's 856 sort-related functional tests ran with it forced on: no result changed.
-- A [4½-minute video](https://youtu.be/mEXKimDtu-8) presents it, and the questions for the maintainers are in [ClickHouse/ClickHouse#133443](https://github.com/ClickHouse/ClickHouse/issues/133443).
+- On ClickHouse's own sort performance tests (81 queries, 24 vCPUs), it is 2.24x faster as the final merge and 3.34x as the whole sort (geometric means over the queries it handles).
+- The sort-related functional tests (ClickHouse's 856 and the branch's own) ran with it forced on: of the 618 that pass on the test server with the default sort, only 4 stop passing, because they look for the default transform's name in `EXPLAIN`.
+- A [5-minute video](https://youtu.be/57rykWpvSaY) presents it, and the questions for the maintainers are in [ClickHouse/ClickHouse#133443](https://github.com/ClickHouse/ClickHouse/issues/133443).
 
 Both videos are narrated with a synthetic voice reading the author's script.
 
